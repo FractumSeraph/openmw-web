@@ -1906,15 +1906,17 @@ do
   -- A target running +250 u/s along y, poses every 66 ms, then the stream is late.
   for i = 0, 5 do it:push({ t = i * 0.066, x = 0, y = i * 0.066 * 250, z = 0, yaw = 0, pitch = 0, flags = 1 }) end
   local newest = 5 * 0.066
-  -- 40 ms past the newest sample in render time (now = newest + RENDER_DELAY + 0.04).
-  local tg = it:target(newest + 0.04 + 0.04)
+  it:target(newest) -- the first read adopts the delay this stream wants
+  local d = it:delay()
+  -- 40 ms past the newest sample in render time (now = newest + delay + 0.04).
+  local tg = it:target(newest + d + 0.04)
   check('a query past the newest pose carries on along the last step (was clamped to it)',
     tg ~= nil and tg.y > newest * 250 + 5, string.format('y %.1f, newest %.1f', tg and tg.y or -1, newest * 250))
-  local far = it:target(newest + 0.04 + 1.0)
+  local far = it:target(newest + d + 1.0)
   check('...by at most EXTRAP_S of it (a real stop overshoots <= ~22 u at a run, s172 #175)',
     far ~= nil and far.y <= newest * 250 + 0.09 * 250 + 0.5, string.format('y %.1f', far and far.y or -1))
   check('the speed feed-forward keeps reading the run through a late pose',
-    it:speed(newest + 0.04 + 0.04) > 200, string.format('speed %.0f', it:speed(newest + 0.04 + 0.04)))
+    it:speed(newest + d + 0.04) > 200, string.format('speed %.0f', it:speed(newest + d + 0.04)))
   local pp = io.open('./openmw/files/data/scripts/mp/puppet.lua'):read('*a')
   local cc = io.open('./openmw/apps/openmw/mwmechanics/character.cpp'):read('*a')
   check('puppet steering may exceed top speed to close a gap',
@@ -1924,11 +1926,96 @@ do
   package.loaded['scripts.mp.interp'] = nil
 end
 
-print('s172 the render-delay buffer was cut below one batch interval (#175: the 450 ms time-lag bar)')
+print('players said NPCs are jerky and movement rubber-bandy: the render delay adapts to the stream (it was a fixed 40 ms, below one batch interval)')
 do
+  package.loaded['scripts.mp.interp'] = nil
+  local Interp = dofile('./openmw/files/data/scripts/mp/interp.lua')
+  local function feed(it, gaps, n, speed)
+    local t, y = 0, 0
+    for i = 1, n do
+      local g = gaps[(i % #gaps) + 1]
+      t = t + g
+      it:push({ t = t, x = 0, y = t * speed, z = 0, yaw = 0, pitch = 0, flags = 1 })
+    end
+    return t
+  end
+  local steady = Interp.new(); feed(steady, { 0.066 }, 40, 140)
+  check('a steady 15 Hz stream settles near one interval (not 40 ms)',
+    steady:wantedDelay() >= 0.07 and steady:wantedDelay() <= 0.13, string.format('%.3f', steady:wantedDelay()))
+  local jitter = Interp.new(); feed(jitter, { 0.033, 0.099 }, 40, 140)
+  check('a jittery stream buys itself more buffer than a steady one', jitter:wantedDelay() > steady:wantedDelay() + 0.03,
+    string.format('%.3f vs %.3f', jitter:wantedDelay(), steady:wantedDelay()))
+  local slow = Interp.new(); feed(slow, { 0.2 }, 30, 140)
+  check('a 5 Hz mid-tier stream is interpolated over its own interval', slow:wantedDelay() >= 0.2 and slow:wantedDelay() <= 0.30,
+    string.format('%.3f', slow:wantedDelay()))
+  local stop = Interp.new(); feed(stop, { 0.066 }, 20, 140); stop:push({ t = 99, x = 0, y = 0, z = 0, yaw = 0, pitch = 0, flags = 0 })
+  check('a long silence (a stop, a cell load) is not read as jitter', stop:wantedDelay() < 0.13, string.format('%.3f', stop:wantedDelay()))
+  -- RENDERED SMOOTHNESS at 60 fps. The server makes a pose every 66 ms (positions are exactly
+  -- 140 u/s apart); the link delivers them bunched and late (arrival = made + 50 ms + a 0/30 ms
+  -- jitter, so gaps alternate ~36/96 ms). Measured: the worst frame-to-frame speed against the
+  -- real 140 u/s. REFERENCE = the previous interp.lua, verbatim in effect: samples stamped by
+  -- ARRIVAL, a fixed 40 ms delay, extrapolation capped at 90 ms.
+  local function arrivals()
+    local out, prevA = {}, 0
+    for i = 1, 80 do
+      local g = i * 0.066
+      local a = math.max(g + 0.05 + ((i % 2 == 0) and 0.03 or 0), prevA + 0.004)
+      prevA = a
+      out[#out + 1] = { t = a, y = g * 140 }
+    end
+    return out
+  end
+  local function legacyTarget(buf, rt)
+    local n = #buf
+    if rt <= buf[1].t then return buf[1] end
+    for i = n, 1, -1 do
+      if buf[i].t <= rt then
+        local a, b = buf[i], buf[i + 1]
+        if not b then
+          local p, h = buf[i - 1], math.min(rt - a.t, 0.09)
+          if not p or h <= 0 or a.t - p.t < 1e-3 then return a end
+          return { y = a.y + (a.y - p.y) * h / (a.t - p.t) }
+        end
+        local k = (rt - a.t) / math.max(b.t - a.t, 1e-6)
+        return { y = a.y + (b.y - a.y) * k }
+      end
+    end
+    return buf[n]
+  end
+  local function worst(render)
+    local arr, nxt, prevY, w = arrivals(), 1, nil, 0
+    local last = arr[#arr].t - 0.1
+    for now = 1.0, last, 1 / 60 do
+      local fed = {}
+      while arr[nxt] and arr[nxt].t <= now do nxt = nxt + 1 end
+      for i = 1, nxt - 1 do fed[i] = arr[i] end
+      local y = render(fed, nxt - 1, now)
+      if y and prevY and now > 2.0 then w = math.max(w, math.abs(y - prevY) * 60 / 140) end
+      prevY = y or prevY
+    end
+    return w
+  end
+  local itNew = Interp.new()
+  local pushed = 0
+  local wNew = worst(function(fed, n, now)
+    while pushed < n do pushed = pushed + 1; itNew:push({ t = fed[pushed].t, x = 0, y = fed[pushed].y, z = 0, yaw = 0, pitch = 0, flags = 1 }) end
+    local tg = itNew:target(now)
+    return tg and tg.y
+  end)
+  local wOld = worst(function(fed, n, now)
+    if n < 2 then return nil end
+    local tg = legacyTarget(fed, now - 0.04)
+    return tg and tg.y
+  end)
+  check('rendered speed stays within 1.4x of the real walking speed with the adaptive delay', wNew <= 1.4, string.format('worst %.2fx', wNew))
+  check('...where the old fixed 40 ms delay on arrival stamps lurched well past it (the complaint)', wOld > wNew + 0.5, string.format('old %.2fx vs %.2fx', wOld, wNew))
+  local pl = io.open('./openmw/files/data/scripts/mp/player.lua'):read('*a')
+  check('a self divergence under the dead zone is not corrected (players: slightly rubber-bandy)',
+    pl:find('local CORRECT_DEADZONE = 5', 1, true) ~= nil and pl:find('if dist < CORRECT_DEADZONE then return end', 1, true) ~= nil
+    and pl:find('if dist < 1 then return end', 1, true) == nil)
   local it = io.open('./openmw/files/data/scripts/mp/interp.lua'):read('*a')
-  check('RENDER_DELAY is 40 ms, not the old 75', it:find('local RENDER_DELAY = 0.04', 1, true) ~= nil)
-  check('EXTRAP_S was raised to cover it', it:find('local EXTRAP_S = 0.09', 1, true) ~= nil)
+  check('the delay is bounded and slewed, never a jump', it:find('local MAX_DELAY = 0.30', 1, true) ~= nil and it:find('local SLEW = 0.1', 1, true) ~= nil)
+  package.loaded['scripts.mp.interp'] = nil
 end
 
 print('s120 a puppet that stays far from its owner is snapped to it (#179: 260 u off, under the 256 u snap)')
