@@ -12,6 +12,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountStore } from '../src/core/accounts';
+import { deleteAccount } from '../src/persist/erase';
 import { tmpDataDir } from './helpers';
 
 async function newAccount(store: AccountStore, name: string) {
@@ -83,4 +84,79 @@ test('email and ban are written through too', async () => {
   const back = await fresh.get('someone');
   assert.equal(back?.email, 'player@example.com');
   assert.equal(back?.banned, true, 'a banned player would still be playing');
+});
+
+// THE STALE-FLUSH ROLLBACK. The gateway and every world hold their own AccountStore over one
+// accounts.db. touchLastSeen queued a key, and flush() then wrote this process's WHOLE cached
+// doc back — merging only the character list — so a world holding the copy it read at join
+// reverted whatever another process had written since: a rank, a ban, a dashboard role, a
+// password. And an account the admin erased came straight back on the next flush.
+test('a stale flush does not revert fields another process wrote', async () => {
+  const dir = tmpDataDir();
+  const world = new AccountStore(dir);
+  const gateway = new AccountStore(dir);
+  await newAccount(world, 'someone');
+  await world.get('someone');
+  world.touchLastSeen('someone'); // a player left this world: its copy is now queued
+
+  await gateway.get('someone');
+  gateway.setRank('someone', 3);
+  gateway.setBanned('someone', true);
+  assert.equal(await gateway.setDashboardRole('someone', 'moderator'), true);
+
+  await world.flush(); // the world writes back its unrelated lastSeenAt
+
+  const back = await new AccountStore(dir).get('someone');
+  assert.equal(back?.rank, 3, 'the promotion was reverted by a stale flush');
+  assert.equal(back?.banned, true, 'the ban was reverted by a stale flush');
+  assert.equal(back?.dashboardRole, 'moderator', 'the dashboard role was reverted by a stale flush');
+});
+
+test('a queued lastSeenAt does not hide a ban from the next login', async () => {
+  const dir = tmpDataDir();
+  const world = new AccountStore(dir);
+  const gateway = new AccountStore(dir);
+  await newAccount(world, 'someone');
+  await world.get('someone');
+  world.touchLastSeen('someone');
+
+  await gateway.get('someone');
+  gateway.setBanned('someone', true);
+
+  assert.equal((await world.get('someone'))?.banned, true, 'the world served its pinned pre-ban copy');
+});
+
+test('a stale flush does not resurrect an erased account', async () => {
+  const dir = tmpDataDir();
+  const world = new AccountStore(dir);
+  await newAccount(world, 'someone');
+  world.touchLastSeen('someone');
+
+  assert.equal((await deleteAccount(dir, 'someone')).account, true);
+  await world.flush();
+
+  assert.equal(await new AccountStore(dir).get('someone'), undefined, 'the erased account came back');
+});
+
+// A FIELD REMOVED ELSEWHERE STAYS REMOVED. mutate() folded the disk doc over the caller's object
+// with Object.assign, which never deletes: a dashboard role revoked (or a 2FA secret reset) in the
+// gateway while a world still held the account came back the next time that world wrote it.
+test('a field another process removed is not written back by a held account', async () => {
+  const dir = tmpDataDir();
+  const world = new AccountStore(dir);
+  const gateway = new AccountStore(dir);
+  await newAccount(world, 'someone');
+  assert.equal(await gateway.setDashboardRole('someone', 'moderator'), true);
+  assert.equal(await gateway.setTotpSecret('someone', 'SECRET'), true);
+  const held = await world.get('someone'); // the world's connection holds this object
+  assert.equal(held?.dashboardRole, 'moderator');
+
+  assert.equal(await gateway.setDashboardRole('someone', undefined), true);
+  assert.equal(await gateway.setTotpSecret('someone', undefined), true);
+  world.createCharacter(held!, 'Someone'); // any write-through from the world
+
+  const back = await new AccountStore(dir).get('someone');
+  assert.equal(back?.dashboardRole, undefined, 'the revoked dashboard role came back');
+  assert.equal(back?.totpSecret, undefined, 'the reset 2FA secret came back');
+  assert.equal(back?.characters?.length, 1, 'the write itself still landed');
 });

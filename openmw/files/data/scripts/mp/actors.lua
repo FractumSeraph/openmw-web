@@ -173,9 +173,18 @@ end
 -- walked it at 28, and it fell behind into a far-gap teleport every few seconds (s190, prod
 -- 2026-10-16 "enemies teleport side to side"). Measured over at least 0.2 s between samples.
 local movedFrom = {}
+-- Pruned, or the peer kept one entry per actor it ever streamed (every summon and respawn is a
+-- new id) for the life of the world. An entry not sampled for 10 s is only a stale baseline.
+local movedPrunedAt = 0
 local function actualSpeed(obj, pos)
     local key = obj.id
     local now = core.getRealTime()
+    if now - movedPrunedAt > 30 then
+        movedPrunedAt = now
+        for k, old in pairs(movedFrom) do
+            if now - old.t > 10 then movedFrom[k] = nil end
+        end
+    end
     local m = movedFrom[key]
     if not m then movedFrom[key] = { x = pos.x, y = pos.y, t = now, v = 0 }; return 0 end
     local dt = now - m.t
@@ -1335,8 +1344,11 @@ function actors.tick(now)
                 -- yaw: the drawn facing, which the page compares with the server's for the same
                 -- NPC (telemetry npcFacing) -- "they do 180s as they walk" was invisible in
                 -- every position metric (prod 2026-10-14).
+                -- id/net: WHICH stream is this body's -- the page matches it to its own poses
+                -- (telemetry npcPath), not to whichever actor happens to stand nearest.
                 probe[rec] = { x = p.x, y = p.y, z = p.z, yaw = obj.rotation:getYaw(), dead = types.Actor.isDead(obj),
-                    guard = isGuard, hp = hp, n = probeN[rec] or 1, puppet = puppeted }
+                    guard = isGuard, hp = hp, n = probeN[rec] or 1, puppet = puppeted,
+                    id = obj.id, net = deps.netIdOf and deps.netIdOf(obj) or nil }
             end
         end
         mp.set('actorProbe', json.encode(probe))

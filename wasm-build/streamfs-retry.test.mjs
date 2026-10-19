@@ -7,6 +7,16 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const src = readFileSync(new URL('../play/streamfs.js', import.meta.url), 'utf8');
+// THE FILE ITSELF MUST PARSE. The worker's code is a template literal inside streamfs.js, and this
+// test reads it out of the source -- so a backtick in a worker comment ended the template, broke
+// every page load (Jenkins #228: 74 of 75 scenarios, "Unexpected identifier 'end'"), and this test
+// still passed. Compile the real file, and the worker source as the page builds it.
+{
+  const vm = await import('node:vm');
+  new vm.Script(src, { filename: 'play/streamfs.js' });
+  const tpl = src.slice(src.indexOf('return `') + 'return `'.length);
+  assert.ok(!tpl.slice(0, tpl.indexOf('`;')).includes('${'), 'no interpolation inside the worker source');
+}
 const body = src.slice(src.indexOf('const ATTEMPTS'), src.indexOf('onmessage = async'));
 assert.ok(body.includes('async function rangeFetch'), 'rangeFetch is where this test expects it');
 
@@ -16,7 +26,8 @@ function load(fetchImpl, attemptMs) {
   return new Function('fetch', 'AbortController', 'setTimeout', 'clearTimeout', code + '; return rangeFetch;')(
     fetchImpl, AbortController, setTimeout, clearTimeout);
 }
-const ok = (n) => ({ ok: false, status: 206, arrayBuffer: async () => new Uint8Array(n).buffer });
+const ok = (n) => new Response(new Uint8Array(n), { status: 206, headers: { 'content-range': 'bytes 0-' + (n - 1) + '/*' } });
+const status = (code) => new Response(null, { status: code });
 
 // Two network failures, then success.
 let calls = 0;
@@ -26,7 +37,7 @@ assert.equal(calls, 3, 'retried through two drops');
 
 // A 503 then success.
 calls = 0;
-rf = load(async () => (++calls === 1 ? { ok: false, status: 503 } : ok(4)), 1000);
+rf = load(async () => (++calls === 1 ? status(503) : ok(4)), 1000);
 assert.equal((await rf('u', 0, 4)).length, 4);
 
 // A hung first attempt is aborted on its deadline and the retry answers.
@@ -40,7 +51,7 @@ assert.equal(calls, 2);
 
 // A 404 is an answer: no retry.
 calls = 0;
-rf = load(async () => { calls++; return { ok: false, status: 404 }; }, 1000);
+rf = load(async () => { calls++; return status(404); }, 1000);
 await assert.rejects(rf('u', 0, 2), /HTTP 404/);
 assert.equal(calls, 1, 'a 404 is not retried');
 
@@ -49,5 +60,70 @@ calls = 0;
 rf = load(async () => { calls++; throw new TypeError('Failed to fetch'); }, 1000);
 await assert.rejects(rf('u', 0, 2), /Failed to fetch/);
 assert.equal(calls, 4);
+
+// THE PREFETCH GETS ONE DEADLINED ATTEMPT. It used a bare fetch with no deadline: stalled, it held
+// the read of the same chunk (which waits on it) past the main thread's 60 s timeout.
+calls = 0;
+rf = load(async () => { calls++; throw new TypeError('Failed to fetch'); }, 1000);
+await assert.rejects(rf('u', 0, 2, 1), /Failed to fetch/);
+assert.equal(calls, 1, 'tries=1 is one attempt');
+{
+  const pre = src.slice(src.indexOf('SEQUENTIAL PREFETCH'), src.indexOf('} catch (err) {', src.indexOf('SEQUENTIAL PREFETCH')));
+  assert.ok(/rangeFetch\(m\.url, m\.next\.start, m\.next\.end, 1, 10000\)/.test(pre) && !/await fetch\(/.test(pre), 'the prefetch goes through rangeFetch');
+}
+
+// A 200 IS THE WHOLE FILE (the Range was ignored): only the requested slice comes back.
+rf = load(async () => new Response(Uint8Array.from({ length: 64 }, (_, i) => i), { status: 200 }), 1000);
+assert.deepEqual([...(await rf('u', 8, 12))], [8, 9, 10, 11], 'a 200 is sliced to the range');
+
+// A SLOW BODY IS NOT A HUNG ONE (prod 2026-10-18, the boot read of Morrowind.bsa): pieces 30 ms
+// apart for 150 ms, under a 50 ms deadline, still complete -- the clock restarts on each piece.
+calls = 0;
+rf = load(async (url, opts) => { calls++; let k = 0; return new Response(new ReadableStream({
+  async pull(c) { await new Promise((r) => setTimeout(r, 30)); if (opts.signal.aborted) return c.error(new Error('aborted')); if (k++ < 5) c.enqueue(new Uint8Array(2)); else c.close(); },
+}), { status: 206 }); }, 50);
+assert.equal((await rf('u', 0, 10)).length, 10);
+assert.equal(calls, 1, 'one attempt, not restarted at the deadline');
+
+// ...BUT THE WHOLE READ HAS A BUDGET: a trickle that would outlast the page's 60 s ceiling is
+// cut at the budget, and no retry starts past it.
+calls = 0;
+rf = load(async (url, opts) => { calls++; return new Response(new ReadableStream({
+  async pull(c) { await new Promise((r) => setTimeout(r, 30)); if (opts.signal.aborted) return c.error(new Error('aborted')); c.enqueue(new Uint8Array(1)); },
+}), { status: 206 }); }, 1000);
+{
+  const t0 = Date.now();
+  await assert.rejects(rf('u', 0, 1000, 4, 200), /aborted/);
+  assert.ok(Date.now() - t0 < 900, 'the budget, not four silence deadlines, ended the read');
+  assert.equal(calls, 1, 'no retry past the budget');
+}
+
+// The failure says what each attempt saw: status, ranges, bytes, ms.
+rf = load(async () => new Response(new Uint8Array(3), { status: 206, headers: { 'content-range': 'bytes 0-2/9' } }), 1000);
+await assert.rejects(rf('u', 0, 8), (e) => /short body 3\/8/.test(e.message) && /206 cl=\S+ cr=bytes 0-2\/9 .*got=3 \d+ms/.test(e.message) && e.message.split('; ').length === 4);
+
+// WARM-UP BUDGET (prod 2026-10-17): chunks already in the store cost nothing, so a file mostly
+// cached from a past visit is still finished; new bytes stop at the budget.
+{
+  const warmSrc = body.slice(body.indexOf('let fg = 0'));
+  const stored = new Set(['https://sfs.chunk/big/0', 'https://sfs.chunk/big/2']); // 2 of 4 chunks cached
+  const puts = [];
+  const msgs = [];
+  const fakeCaches = { open: async () => ({ match: async (k) => stored.has(k), put: async (k) => { puts.push(k); stored.add(k); } }) };
+  const run = new Function('fetch', 'AbortController', 'setTimeout', 'clearTimeout', 'caches', 'postMessage', 'Response',
+    body.slice(0, body.indexOf('let fg = 0')) + warmSrc + '; return warm;');
+  const fetchFake = async (url, opts) => ok(2);
+  let warm = run(fetchFake, AbortController, (f) => setTimeout(f, 0), clearTimeout, fakeCaches, (m) => msgs.push(m), class { constructor(b) { this.b = b; } });
+  // 4 chunks of 2 bytes, 2 cached, budget 10 bytes: the 2 missing chunks are fetched (4 bytes).
+  await warm([{ url: 'u', pkey: 'big', size: 8 }], 2, 10);
+  assert.deepEqual(puts, ['https://sfs.chunk/big/4', 'https://sfs.chunk/big/6'], 'only the missing chunks are fetched');
+  assert.deepEqual(msgs.at(-1), { warmed: 0, done: true, err: null }, 'finished within budget');
+  // A budget smaller than what is missing stops with 'budget', after what fits.
+  stored.clear(); puts.length = 0; msgs.length = 0;
+  warm = run(fetchFake, AbortController, (f) => setTimeout(f, 0), clearTimeout, fakeCaches, (m) => msgs.push(m), class { constructor(b) { this.b = b; } });
+  await warm([{ url: 'u', pkey: 'big', size: 8 }], 2, 5);
+  assert.equal(puts.length, 2, 'two chunks fit a 5-byte budget');
+  assert.equal(msgs.at(-1).err, 'budget');
+}
 
 console.log('streamfs retry: ok');

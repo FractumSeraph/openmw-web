@@ -396,7 +396,11 @@ function handleNumberMap(ctx: StateCtx, player: Player, body: LTable, field: 'at
   // #369: refused, not counted -- the server's copy stands and the next declaration is
   // measured against it. The first declaration (no baseline) is accepted as chargen's.
   const had = ctx.store.getCached(player.charId)?.stats?.[field];
-  if (had && !ctx.harness) {
+  // ...and chargen keeps being chargen after that first declaration: a page reloaded mid-
+  // creation reopens the baseline on the race step, and the class pick in the census office
+  // (+10 favoured attributes, +15..25 major skills) is a raise no window allows. Refused, it
+  // never landed: prod Arf/Kovroi kept race-only stats and lost the class on the next login.
+  if (had && !ctx.harness && player.inChargen !== true) {
     for (const [k, v] of Object.entries(map)) {
       // #393: a key the previous declaration omitted is a raise FROM ZERO, not a free pass --
       // dropping Long Blade and re-adding it at 100 was measured against nothing. Damage keys
@@ -1025,7 +1029,10 @@ function handleActiveSpells(ctx: StateCtx, player: Player, body: LTable): boolea
   // ...or an item the last inventory diff just took away: the last potion of a kind is drunk
   // before the 2 s inventory diff lands, and the 0.5 s active diff may lose that race.
   const known = (id: string) => doc?.spells?.includes(id) === true || doc?.inventory?.some((i) => i.id === id) === true
-    || (player.recentlyUsed?.get(id) ?? 0) > nowMs - ACTIVE_MAG_WINDOW_MS;
+    || (player.recentlyUsed?.get(id) ?? 0) > nowMs - ACTIVE_MAG_WINDOW_MS
+    // ...or one credited since the last snapshot: looted or bought and drunk inside one diff,
+    // it was never in the doc at all.
+    || (player.pendingAcquired?.get(id) ?? 0) > 0;
   const unknown = add.find((op) => !known(op.id));
   if (unknown) {
     noteGain(ctx, player, 'active_spell_unknown', { id: unknown.id });

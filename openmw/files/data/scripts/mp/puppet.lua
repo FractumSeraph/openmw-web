@@ -122,7 +122,14 @@ local stuckSince = nil
 -- distance; every later correction keeps the existing distance and cooldown rules.
 local placed = false
 local lastProgressPos = nil
-local prevJump = false
+-- EVERY JUMP THE RENDER TIME PASSED, not the one sample a frame lands on. A jump rides ONE pose
+-- (bit 2, ~66 ms of render time); read off the target once a frame, a client under 15 fps (9%
+-- of prod telemetry windows, 2026-10) stepped over it and the friend never left the ground.
+-- Each sample is marked once render time has passed it, NOT compared with the last scanned time:
+-- interp.lua stamps a sample after a pause at last.t + mean (pulled toward arrival), which can be
+-- BEHIND what was already scanned -- a friend who stood still for 0.3 s and jumped never left
+-- the ground.
+local jumpPrimed = false -- the first scan only marks: history is not played late
 -- The use bit's edges AS RECEIVED, latched until a frame plays them (s171). A creature's bite
 -- holds the bit for ONE peer frame (50 ms); read off the render-delayed target once per client
 -- frame, that pulse fell between frames on any client under 20 fps and the rat bit the player
@@ -437,6 +444,16 @@ local function onUpdate(dt)
         zeroControls()
         return
     end
+    -- Scanned before any early return, so a jump passed while parked, snapped or far-tiered is
+    -- dropped (as it always was), never played late.
+    local rt, jumped = now - interp:delay(), false
+    for _, s in ipairs(interp.buf) do
+        if not s.jumpSeen and s.t <= rt then
+            s.jumpSeen = true
+            if jumpPrimed and bit(s.flags, 2) then jumped = true end
+        end
+    end
+    jumpPrimed = true
 
     local pos = self.position
     local dx, dy = target.x - pos.x, target.y - pos.y
@@ -587,9 +604,7 @@ local function onUpdate(dt)
         end
         pcall(function() types.Actor.setStance(self, want) end)
     end
-    local jumpEdge = bit(target.flags, 2)
-    self.controls.jump = jumpEdge and not prevJump
-    prevJump = jumpEdge
+    self.controls.jump = jumped
 end
 
 return {
@@ -600,14 +615,23 @@ return {
             self:enableAI(false) -- the pose stream owns this actor, not the AI
             markPuppet(true)
         end,
+        -- NOT ONLY A SAVE GAME. The engine unloads an INACTIVE object's scripts a few hundred
+        -- frames after its cell goes out of view (ScriptTracker::unloadInactiveScripts) and
+        -- reloads them through onSave/onLoad. A degraded puppet in the exterior a player had
+        -- left came back with no key and its AI switched off: the next pose did not re-arm it,
+        -- and it stood 200-500 u from the peer's NPC with no snap until the session ended
+        -- (prod ar5tbvgs, Pelagiad, after a door hop between two interiors).
         onLoad = function(data)
             playerId = data and data.playerId
             actorKey = data and data.actorKey
+            degradedKey = data and data.degradedKey
+            degraded = degradedKey ~= nil
+            if not (playerId or actorKey) then return end -- not a live puppet: its AI stays as MP_Detach left it
             self:enableAI(false)
             markPuppet(true)
         end,
         onSave = function()
-            return { playerId = playerId, actorKey = actorKey }
+            return { playerId = playerId, actorKey = actorKey, degradedKey = degraded and degradedKey or nil }
         end,
         onUpdate = onUpdate,
     },
@@ -626,6 +650,15 @@ return {
             -- Absent tier (a server predating G2, or renderLod = "full") means near: the
             -- fallback must be full fidelity, never a silent degrade.
             tier = e.tier or TIER_NEAR
+            -- A TELEPORT IS NOT A PATH. A friend who respawns or takes a door within the cell
+            -- jumps thousands of units between two poses; interpolated, the render-delayed target
+            -- swept the line between them, the distance snap put the body on a point of it, and
+            -- the 1 s snap cooldown left it standing there. Start the buffer over at the new spot.
+            local last = interp.buf[#interp.buf]
+            local far = SNAP_BY_TIER[tier] or SNAP_DISTANCE
+            if last and e.x and ((e.x - last.x) ^ 2 + (e.y - last.y) ^ 2 + (e.z - last.z) ^ 2) > far * far then
+                interp:clear()
+            end
             interp:push(e)
             local u = bit(e.flags, 3)
             if u and not rxUse then pressLatch = true end
@@ -757,7 +790,8 @@ return {
         -- hit intercept) attached; the other cases have global.lua remove it right after.
         MP_Detach = function(data)
             degraded = data and data.degraded == true
-            degradedKey = degraded and actorKey or nil
+            -- A second outage before any pose re-armed it must not forget the address.
+            degradedKey = degraded and (actorKey or degradedKey) or nil
             actorKey = nil
             playerId = nil
             dead = false

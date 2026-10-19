@@ -85,24 +85,62 @@
       // player on a slow link stuck on the loading screen for five minutes, another's game dead
       // mid-session. Each attempt gets its own deadline; network errors, 408/429 and 5xx are
       // retried with a short backoff. A 4xx is an answer, not a blip, and is not retried.
-      const ATTEMPTS = 4, ATTEMPT_MS = 12000;
-      async function rangeFetch(url, start, end) {
+      //
+      // THE DEADLINE IS FOR SILENCE, NOT FOR THE WHOLE READ. Prod 2026-10-17/18: the first read
+      // of Morrowind.bsa at boot (offset 0, 2 MB) failed in ~54 s -- exactly four 12 s attempts
+      // plus backoff -- for ~15 of 24 never-joined worlds, while the same CDN answers that range
+      // in 0.2-0.6 s cold or warm. A body still arriving slowly (a boot link busy with the engine's
+      // own downloads) was cut at 12 s and started over from byte 0 every time. The clock now
+      // restarts on every piece received; only 12 s of nothing aborts.
+      // A 200 is the WHOLE FILE (the Range was ignored): it used to be returned whole, so a read at
+      // any offset but 0 got the file's first bytes, and the main thread was told the chunk was
+      // hundreds of MB. Read only up to end, cancel the rest, and slice.
+      // ponytail: a 200 at a deep offset still downloads everything before it; ranges are honoured today.
+      // Each attempt's outcome rides the error (status, ranges, bytes, ms): the page ships it.
+      // AND THE WHOLE READ HAS A BUDGET under the main thread's 60 s ceiling (fetchChunkSync).
+      // With the silence clock restarting on every piece, one trickling attempt could outlast
+      // that ceiling: the page threw "read timeout" with a retry still to come, and the worker
+      // went on writing into the shared buffer after the page had given up on it.
+      const ATTEMPTS = 4, ATTEMPT_MS = 12000, BUDGET_MS = 48000;
+      async function rangeFetch(url, start, end, tries = ATTEMPTS, budget = BUDGET_MS) {
         let last;
-        for (let i = 0; i < ATTEMPTS; i++) {
+        const seen = [];
+        const fail = (err) => new Error(String(err && err.message || err) + ' [' + seen.join('; ') + ']');
+        const begun = Date.now();
+        const clock = () => Math.max(0, Math.min(ATTEMPT_MS, budget - (Date.now() - begun)));
+        for (let i = 0; i < tries; i++) {
           if (i) await new Promise((r) => setTimeout(r, 400 * i * i));
+          if (Date.now() - begun >= budget) break;
           const ac = new AbortController();
-          const t = setTimeout(() => ac.abort(), ATTEMPT_MS);
+          let t = setTimeout(() => ac.abort(), clock());
+          const t0 = Date.now();
+          let what = '', got = 0;
           try {
             const r = await fetch(url, { headers: { Range: 'bytes=' + start + '-' + (end - 1) }, signal: ac.signal });
-            if (r.ok || r.status === 206) return new Uint8Array(await r.arrayBuffer());
+            what = r.status + ' cl=' + r.headers.get('content-length') + ' cr=' + r.headers.get('content-range');
+            if (r.ok || r.status === 206) {
+              const whole = r.status !== 206, want = whole ? end : end - start;
+              const buf = new Uint8Array(want), rd = r.body.getReader();
+              while (got < want) {
+                const { done, value } = await rd.read();
+                if (done) break;
+                clearTimeout(t); t = setTimeout(() => ac.abort(), clock());
+                const n = Math.min(value.length, want - got);
+                buf.set(value.subarray(0, n), got); got += n;
+              }
+              if (got < want) throw new Error('short body ' + got + '/' + want);
+              if (whole) rd.cancel().catch(() => {});
+              return whole ? buf.subarray(start, end) : buf;
+            }
             last = new Error('HTTP ' + r.status);
-            if (r.status < 500 && r.status !== 408 && r.status !== 429) throw last;
-          } catch (err) {
-            last = err;
-            if (/^HTTP 4/.test(String(err && err.message)) && !/^HTTP 4(08|29)/.test(err.message)) throw err;
-          } finally { clearTimeout(t); }
+            last.http = r.status;
+          } catch (err) { last = err; }
+          finally { clearTimeout(t); }
+          seen.push((what || 'no response') + ' ' + (last && (last.name + ': ' + last.message) || '').slice(0, 60) + ' got=' + got + ' ' + (Date.now() - t0) + 'ms');
+          // A 4xx is an answer, not a blip: no retry (408/429 are blips).
+          if (last.http >= 400 && last.http < 500 && last.http !== 408 && last.http !== 429) throw fail(last);
         }
-        throw last;
+        throw fail(last);
       }
       // BACKGROUND WARM-UP. A first read of any chunk is a network round trip with the game's
       // main thread blocked on it (fetchChunkSync), which is the mid-play hitch players see when
@@ -112,10 +150,13 @@
       // has not asked for anything for 1.5 s: it never competes with a read the game is waiting on.
       let fg = 0, lastFg = 0, warming = false;
       const nap = (ms) => new Promise((r) => setTimeout(r, ms));
-      async function warm(files, chunk) {
+      async function warm(files, chunk, budget) {
         if (warming) return;
         warming = true;
         let fetched = 0, fetchFails = 0, stop = null;
+        // BYTES WE MAY STILL ADD, not bytes the files weigh: a chunk already in the store costs
+        // nothing (see warm() on the main thread).
+        let left = typeof budget === 'number' ? budget : Infinity;
         try {
           const c = await caches.open('mwdata-chunks-v1');
           outer: for (const f of files) {
@@ -133,8 +174,10 @@
                 await nap(5000); continue;
               }
               fetchFails = 0;
+              if (buf.length > left) { stop = 'budget'; break outer; }
               try { await c.put(ckey, new Response(buf)); }
               catch (err) { stop = 'store: ' + String(err && err.name || err).slice(0, 60); break outer; }
+              left -= buf.length;
               fetched++; postMessage({ warmed: 1 });
               await nap(30);
             }
@@ -146,7 +189,7 @@
       onmessage = async (e) => {
         const m = e.data;
         if (m.init) { ctrl = new Int32Array(m.ctrl); data = new Uint8Array(m.data); return; }
-        if (m.warm) { warm(m.warm, m.chunk); return; }
+        if (m.warm) { warm(m.warm, m.chunk, m.budget); return; }
         if (m.mountLocal) { handles.set(m.mountLocal.id, m.mountLocal.handle); return; }
         // A Blob (BSA from the Cache API) reads exactly like a File (slice + arrayBuffer), so it
         // goes straight into the files map and the m.id read path below slices it locally.
@@ -201,14 +244,20 @@
               try {
                 const c = await caches.open('mwdata-chunks-v1');
                 if (await c.match(nkey)) return;
-                const r = await fetch(m.url, { headers: { Range: 'bytes=' + m.next.start + '-' + (m.next.end - 1) } });
-                if (r.ok || r.status === 206) await c.put(nkey, new Response(await r.arrayBuffer()));
+                // ONE rangeFetch attempt, not a bare fetch: a bare fetch had no deadline, so a stalled
+                // prefetch held the read of this very chunk (which awaits it above) past the 60 s
+                // main-thread timeout -- the game died on "read timeout" -- and a 200 stored the
+                // whole file as this chunk.
+                await c.put(nkey, new Response(await rangeFetch(m.url, m.next.start, m.next.end, 1, 10000)));
               } catch (e) { /* best effort: the read path fetches it itself */ }
               finally { prefetch = null; }
             })() };
           }
         } catch (err) {
-          ctrl[1] = -1;
+          // WHY, for the page's error line: ASCII in the shared buffer, its length as -1 - n.
+          const why = String(err && err.message || err).replace(/[^\x20-\x7e]/g, '?').slice(0, 400);
+          for (let k = 0; k < why.length; k++) data[k] = why.charCodeAt(k);
+          ctrl[1] = -1 - why.length;
           Atomics.store(ctrl, 0, m.gen);
           Atomics.notify(ctrl, 0);
         } finally { fg--; lastFg = Date.now(); }
@@ -242,13 +291,18 @@
     // eviction-thrashing working set shows up as misses climbing without bytes growing.
     const t0 = performance.now();
     while (Atomics.load(S.ctrl, 0) !== gen) {
-      // Above the worker's whole retry budget (4 x 12 s + 0.4/1.6/3.6 s backoff = 53.6 s), so a
-      // read that is still being retried is never abandoned here first.
+      // Above the worker's whole budget (a prefetch it waits on, 10 s, plus its own read, 48 s),
+      // so a read that is still being retried is never abandoned here first.
       if (performance.now() - t0 > 60000) throw new Error('streamfs: read timeout ' + cacheKey + '@' + start);
     }
-    ST.misses++; ST.stallMs += performance.now() - t0;
+    const waited = performance.now() - t0;
+    ST.misses++; ST.stallMs += waited;
+    // WHICH FILE THE GAME WAITED ON (telemetry sfsSlow): a read over 50 ms went to the network,
+    // not the persistent store, and the file says whether the warm-up should have had it.
+    if (waited > 50) { ST.slow = (ST.slow || 0) + 1; const fk = cacheKey.slice(0, cacheKey.lastIndexOf(':')).split('/').pop(); (ST.slowBy || (ST.slowBy = {}))[fk] = (ST.slowBy[fk] || 0) + 1; }
     const n = S.ctrl[1];
-    if (n < 0) throw new Error('streamfs: read failed ' + cacheKey + '@' + start);
+    if (n < 0) throw new Error('streamfs: read failed ' + cacheKey + '@' + start + ' after ' + Math.round(waited) + 'ms: '
+      + String.fromCharCode.apply(null, S.data.subarray(0, -1 - n)));
     const chunk = new Uint8Array(n);
     chunk.set(S.data.subarray(0, n));
     S.cache.set(cacheKey, chunk);
@@ -355,19 +409,22 @@
       for (const [path, src] of S.urlSrcs) if (src.pkey && src.size && re.test(path)) files.push({ path, url: src.url, pkey: src.pkey, size: src.size });
       const rank = (p) => { const i = (first || []).findIndex((r) => r.test(p)); return i < 0 ? 99 : i; };
       files.sort((a, b) => rank(a.path) - rank(b.path));
-      // ONLY WHAT FITS. Warming past the origin's storage quota downloads chunks only to fail
-      // storing them. Files are queued in priority order while they fit in 80% of what is free;
-      // without the estimate API, everything is queued and the worker stops at the first failed put.
-      const send = (list) => { if (list.length) S.worker.postMessage({ warm: list.map(({ url, pkey, size }) => ({ url, pkey, size })), chunk: CHUNK }); };
+      // ONLY WHAT FITS -- COUNTED IN NEW BYTES. Warming past the origin's quota downloads chunks
+      // only to fail storing them, so the worker gets a budget of 80% of what is free and spends
+      // it only on chunks it actually adds. It used to drop any WHOLE FILE larger than the free
+      // room -- and a returning player's usage already holds most of Morrowind.bsa, so the main
+      // archive "did not fit", the warm-up reported done after the small archives (38 chunks),
+      // and every new area waited on the network (prod 2026-10-17, c3iqmpok: 173 misses at
+      // ~0.7 s each on an 87 fps machine). Every file is queued; a big one warms as far as fits.
+      const send = (budget) => { if (files.length) S.worker.postMessage({ warm: files.map(({ url, pkey, size }) => ({ url, pkey, size })), chunk: CHUNK, budget }); };
       if (navigator.storage && navigator.storage.estimate) {
         navigator.storage.estimate().then((est) => {
-          let room = Math.max(0, ((est.quota || 0) - (est.usage || 0)) * 0.8);
-          const fit = [];
-          for (const f of files) { if (f.size <= room) { fit.push(f); room -= f.size; } }
-          if (!fit.length) ST.warmErr = 'no room: ' + Math.round(((est.quota || 0) - (est.usage || 0)) / 1048576) + ' MB free';
-          send(fit);
-        }, () => send(files));
-      } else send(files);
+          const free = Math.max(0, (est.quota || 0) - (est.usage || 0));
+          ST.roomMb = Math.round(free / 1048576);
+          if (free * 0.8 < CHUNK) ST.warmErr = 'no room: ' + ST.roomMb + ' MB free';
+          send(free * 0.8);
+        }, () => send(undefined));
+      } else send(undefined);
       return files.length;
     },
 

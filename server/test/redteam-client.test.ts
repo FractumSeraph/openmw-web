@@ -89,6 +89,21 @@ test('#359 an active effect needs a source the player has, and adds are budgeted
   assert.equal(peer.inbox.events.filter((e) => e.name === 'AvatarActiveSpells').length, 0, 'the magnitude budget did not hold');
 });
 
+// A potion looted (or bought) and drunk before the 2 s inventory snapshot was never in the doc:
+// its effect was refused as active_spell_unknown and the avatar never got it. The acquisition
+// credit (PlayerItemAcquired) is the same item, reported the moment it arrived.
+test('an effect from an item credited since the last snapshot reaches the avatar', async (t) => {
+  const { server } = await boot(t);
+  const peer = await TestClient.simPeer(server.port, PEER_PASS);
+  t.after(() => peer.close());
+  peer.sendCellChange('0,0', 0, 0, 0);
+  const { c } = await join(t, server, 'Drinker');
+  c.sendEvent('PlayerItemAcquired', { id: 'p_levitation_s', n: 1 });
+  peer.inbox.events.length = 0;
+  c.sendEvent('PlayerActiveSpells', { add: [{ key: '1', id: 'p_levitation_s', effects: [0] }], remove: [] });
+  await peer.waitEvent('AvatarActiveSpells', (v) => (v as { id?: number }).id === c.playerId, 2000);
+});
+
 test('#360 record caps: effects, magnitude, cost floor, armor, charge, speed, reach', async (t) => {
   const { server } = await boot(t);
   const { c } = await join(t, server, 'Smith');
@@ -461,4 +476,55 @@ test('a follow claim with no conversation is dropped and recorded; one inside th
   c.sendEvent('ActorAI', { cellKey: '0,0', ref: NPC_REF, follow: c.playerId });
   await peer.waitEvent('ActorAI', (v) => (v as { follow?: number }).follow === c.playerId);
   assert.equal((await anomaliesOf(server.port, TOKEN, 'recruiter')).follow_claim, 1, 'a recruit inside the conversation is not a flag');
+});
+
+// The prison ship's guard escorts every new character on that character's own engine; nobody
+// holds a chargen cell. Its follow report is neither relayed nor stored nor a moderation flag
+// (prod: one per new character, c:397568:1).
+test('the chargen escort is no follow claim: nothing stored, nothing flagged', async (t) => {
+  const { server } = await boot(t);
+  const { c } = await join(t, server, 'Newcomer', 'imperial prison ship');
+  const { c: w } = await join(t, server, 'Watcher', 'imperial prison ship');
+  server.roster.get(c.playerId!)!.inChargen = true;
+  w.inbox.events.length = 0;
+  c.sendEvent('ActorAI', { cellKey: 'imperial prison ship', ref: NPC_REF, follow: c.playerId });
+  await fence(c, w);
+  assert.equal(w.inbox.events.filter((e) => e.name === 'ActorAI').length, 0, 'the chargen escort was relayed');
+  assert.equal((await anomaliesOf(server.port, TOKEN, 'newcomer')).follow_claim ?? 0, 0, 'the chargen escort was flagged');
+});
+
+// ...but the census office is an ordinary room once creation is over: a FINISHED character's
+// bare follow claim there is judged like anywhere else, not silently swallowed with the escort's.
+test('a finished character in a chargen cell is not exempt from the follow-claim rules', async (t) => {
+  const { server } = await boot(t);
+  const office = 'seyda neen, census and excise office';
+  const { c } = await join(t, server, 'Veteran', office);
+  const { c: w } = await join(t, server, 'Watcher', office);
+  server.roster.get(c.playerId!)!.inChargen = false;
+  c.sendEvent('ActorAI', { cellKey: office, ref: NPC_REF, follow: c.playerId });
+  await fence(c, w);
+  assert.equal((await anomaliesOf(server.port, TOKEN, 'veteran')).follow_claim, 1, 'a finished character got the chargen exemption');
+});
+
+// A page reloaded mid-creation reopens the baseline on the RACE step; the class picked after
+// it (+10 favoured attributes, a major skill +15..25) is not a level-up. Refused, the class
+// never reached the doc and the next login restored the race-only character (prod Arf, Kovroi).
+test('#369 does not apply in chargen: the class pick after a mid-creation reload lands', async (t) => {
+  const { server, dataDir } = await boot(t);
+  const { c, charId } = await join(t, server, 'Recruit');
+  server.roster.get(c.playerId!)!.inChargen = true;
+  c.sendEvent('PlayerAttributes', { strength: 40, endurance: 40 }); // the race step
+  c.sendEvent('PlayerSkills', { axe: 5 });
+  await settle();
+  c.sendEvent('PlayerAttributes', { strength: 50, endurance: 50 }); // Warrior, in the census office
+  c.sendEvent('PlayerSkills', { axe: 30 });
+  await settle();
+  server.roster.get(c.playerId!)!.inChargen = false;
+  const refused = c.waitEvent('StateRefused');
+  c.sendEvent('PlayerAttributes', { strength: 60, endurance: 50 }); // past creation the window is back
+  assert.equal(((await refused).value as { kind: string }).kind, 'PlayerAttributes');
+  await server.flush();
+  const doc = readPlayerDoc(dataDir, charId) as { stats?: { attributes?: Record<string, number>; skills?: Record<string, number> } };
+  assert.deepEqual(doc.stats?.attributes, { strength: 50, endurance: 50 }, 'the class attributes were refused');
+  assert.deepEqual(doc.stats?.skills, { axe: 30 }, 'the class skills were refused');
 });
