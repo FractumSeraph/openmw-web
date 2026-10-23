@@ -289,7 +289,16 @@ namespace MWMP
         // bounties live in the registry above), so its guards kept pursuing. Same call the
         // owner's client makes; the peer's player is the reference the witness check in
         // actors.cpp compares against anyway.
-        api["recordCrimePaid"] = []() { MWBase::Environment::get().getWorld()->getPlayer().recordCrimeId(); };
+        // With an avatar: THAT player's crimes are paid (witnesses of others' stay hostile).
+        // Without: the shared mark, every crime so far (a party-wide fine; singleplayer).
+        api["recordCrimePaid"] = [](sol::optional<sol::object> who) {
+            if (who && who->is<MWLua::Object>())
+            {
+                recordAvatarCrimePaid(who->as<MWLua::Object>().id());
+                return;
+            }
+            MWBase::Environment::get().getWorld()->getPlayer().recordCrimeId();
+        };
         // The player's Mark (backlog 155). NpcStats keeps just the cell id and the position,
         // which is what the doc carries: {cell=<serialized cell id, '' when none>, x, y, z}.
         // setMark takes the same id back (an interior name, '#x,y' for an exterior); a cell this
@@ -344,6 +353,16 @@ namespace MWMP
         // The fall damage this engine measured but, the peer ruling the body, did not apply
         // (character.cpp). Taken once: the next call returns 0.
         api["takeFallDamage"] = []() -> float { return MWMP::takeFall(); };
+        api["takeFallKnockdown"] = []() -> bool { return MWMP::takeFallKnockdown(); };
+        // The peer lays an avatar down when its owner's fall knocked the owner down (hp.kd).
+        api["setKnockedDown"] = [](const sol::object& obj) {
+            if (!obj.is<MWLua::Object>())
+                return;
+            const MWWorld::Ptr& ptr = obj.as<MWLua::Object>().ptrOrEmpty();
+            if (ptr.isEmpty() || !ptr.getClass().isActor())
+                return;
+            ptr.getClass().getCreatureStats(ptr).setKnockedDown(true);
+        };
         // Backlog 73: knockdown is not in the Lua stats API; the peer reports it with the avatar
         // bars so the owner stops driving a body that is lying on the floor.
         api["isKnockedDown"] = [](const sol::object& obj) -> bool {

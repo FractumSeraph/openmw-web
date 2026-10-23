@@ -492,6 +492,12 @@ test("a client's PlayerDeath is ignored while the peer reports it alive, honoure
   const o = await (await fetch(`http://127.0.0.1:${server.port}/admin/api/overview`, { headers: { authorization: 'Bearer stats-dash' } })).json() as { players: { account: string; anomalies: Record<string, number> }[] };
   assert.equal(o.players.find((p) => p.account === 'runner')?.anomalies.death_unconfirmed, 1, 'the claimed death is recorded for moderation');
 
+  // Refused AGAIN (the client's 5 s resend): stand it back up where it lies, at the peer's hp.
+  a.sendEvent('PlayerDeath', {});
+  const up = await a.waitEvent('PlayerResurrect', () => true, 3000);
+  assert.deepEqual(up.value, { restoreHp: false, standUp: true, hp: 42 }, 'no refill, no teleport');
+  a.inbox.events.length = 0;
+
   hp = 0;
   await a.waitEvent('SelfStats', (v) => (v as { hp?: { c?: number } })?.hp?.c === 0);
   a.sendEvent('PlayerDeath', {});
@@ -729,5 +735,12 @@ for (const clientAuthority of [true, false]) {
     } else {
       assert.equal(restore, undefined, 'under the replay model the avatar falls itself: no second charge');
     }
+    // A fall that knocked the owner down lays the avatar down (its own AvatarRestore, kd only).
+    peer.inbox.events.length = 0;
+    a.sendEvent('PlayerStatsDynamic', { hp: { c: 90, b: 100, kd: true } });
+    await new Promise((r) => setTimeout(r, 400));
+    const kd = peer.inbox.events.find((e) => e.name === 'AvatarRestore' && (e.value as { kd?: boolean }).kd === true);
+    if (clientAuthority) assert.deepEqual(kd?.value, { id: a.playerId, kd: true }, 'the knockdown never reached the avatar');
+    else assert.equal(kd, undefined, 'under the replay model the avatar falls, and is knocked down, itself');
   });
 }

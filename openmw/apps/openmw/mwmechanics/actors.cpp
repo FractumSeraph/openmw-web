@@ -771,7 +771,16 @@ namespace MWMechanics
 
             // Check if the target is a werewolf or aggressive creature
             bool targetIsCreature = !actor2.getClass().isNpc();
-            bool targetIsAggressiveCreature = targetIsCreature ? getFightTerm(actor2, player) >= 100
+            // MP: measured against the player the creature is FIGHTING -- on the peer that is
+            // an avatar, and getPlayer() is a parked dummy whose fight term means nothing.
+            MWWorld::Ptr creatureFoe = player;
+            if (targetIsCreature)
+            {
+                MWWorld::Ptr combatTarget;
+                if (creatureStats2.getAiSequence().getCombatTarget(combatTarget) && isPlayerOrAvatar(combatTarget))
+                    creatureFoe = combatTarget;
+            }
+            bool targetIsAggressiveCreature = targetIsCreature ? getFightTerm(actor2, creatureFoe) >= 100
                                                                : actor2.getClass().getNpcStats(actor2).isWerewolf();
             if (targetIsAggressiveCreature)
             {
@@ -850,9 +859,16 @@ namespace MWMechanics
                     {
                         if (caster.getClass().isNpc() && caster.getClass().getNpcStats(caster).isWerewolf())
                             caster.getClass().getNpcStats(caster).addWerewolfKill();
-                        if (caster == player || playerFollowers.find(caster) != playerFollowers.end())
+                        // MP: an avatar's spell is a player's spell (the crime lands on its
+                        // owner), and so is one cast by an avatar's companion -- actorKilled
+                        // finds that companion's leader. The local player's followers as before.
+                        const bool casterIsPlayer = isPlayerOrAvatar(caster);
+                        const bool casterFollowsPlayer
+                            = playerFollowers.find(caster) != playerFollowers.end();
+                        if (casterIsPlayer || casterFollowsPlayer || !getPlayerLeader(caster).isEmpty())
                         {
-                            MWBase::Environment::get().getMechanicsManager()->actorKilled(creature, player);
+                            MWBase::Environment::get().getMechanicsManager()->actorKilled(
+                                creature, casterIsPlayer || !casterFollowsPlayer ? caster : player);
                             actorKilled = true;
                             break;
                         }
@@ -1224,7 +1240,11 @@ namespace MWMechanics
                 else
                     creatureStats.getAiSequence().stack(AiPursue(criminal), ptr);
                 creatureStats.setAlarmed(true);
-                npcStats.setCrimeId(world->getPlayer().getNewCrimeId());
+                const int crimeId = world->getPlayer().getNewCrimeId();
+                npcStats.setCrimeId(crimeId);
+                // MP: tie the id to the avatar, so ITS paid fine is the one that calms this guard.
+                if (MWMP::isAvatar(criminal.getCellRef().getRefNum()))
+                    MWMP::noteCrimeOffender(crimeId, criminal.getCellRef().getRefNum());
                 return true;
             };
 
@@ -1239,6 +1259,9 @@ namespace MWMechanics
                     const MWWorld::Ptr& body = other.getPtr();
                     const ESM::RefNum ref = body.getCellRef().getRefNum();
                     if (!MWMP::isAvatar(ref) || body.getClass().getCreatureStats(body).isDead())
+                        continue;
+                    // A werewolf avatar is not pursued for its bounty (as the player is not, above).
+                    if (body.getClass().isNpc() && body.getClass().getNpcStats(body).isWerewolf())
                         continue;
                     if (pursue(body, MWMP::avatarBounty(ref)))
                     {
@@ -1262,7 +1285,13 @@ namespace MWMechanics
         if (npcStats.getCrimeId() != -1)
         {
             // if you've paid for your crimes and I haven't noticed
-            if (npcStats.getCrimeId() <= world->getPlayer().getCrimeId())
+            // MP: an avatar's crime is settled by that avatar's own payment (mwmp/puppets.hpp);
+            // the shared mark (a party-wide fine, or no avatars at all) still settles everything.
+            int paidCrimeId = world->getPlayer().getCrimeId();
+            const ESM::RefNum offender = MWMP::crimeOffender(npcStats.getCrimeId());
+            if (offender.isSet())
+                paidCrimeId = std::max(paidCrimeId, MWMP::avatarPaidCrimeId(offender));
+            if (npcStats.getCrimeId() <= paidCrimeId)
             {
                 // Calm witness down
                 if (ptr.getClass().isClass(ptr, "Guard"))

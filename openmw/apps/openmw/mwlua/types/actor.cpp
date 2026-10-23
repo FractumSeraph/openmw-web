@@ -311,6 +311,12 @@ namespace MWLua
             const MWWorld::Class& cls = o.ptr().getClass();
             return cls.getWalkSpeed(o.ptr());
         };
+        // The speed a full movement control moves this actor at right now: fly or swim speed
+        // for a creature that flies or is in water, where getRunSpeed is its walk speed (mp).
+        actor["getMaxSpeed"] = [](const Object& o) {
+            const MWWorld::Class& cls = o.ptr().getClass();
+            return cls.getMaxSpeed(o.ptr());
+        };
         actor["getCurrentSpeed"] = [](const Object& o) {
             const MWWorld::Class& cls = o.ptr().getClass();
             return cls.getCurrentSpeed(o.ptr());
@@ -408,7 +414,10 @@ namespace MWLua
             if (!target.getClass().isActor())
                 throw std::runtime_error("Actor expected");
 
-            if (target.getCell()->getCell()->getWorldSpace() != player.getCell()->getCell()->getWorldSpace())
+            // Not on a sim peer: its dummy player stands in one worldspace while the anchors
+            // (players) are in interiors it simulates; inSimProcessingRange decides there.
+            if (MWBase::Environment::get().getWorld()->getSimAnchorPositions().empty()
+                && target.getCell()->getCell()->getWorldSpace() != player.getCell()->getCell()->getWorldSpace())
                 return false;
 
             // Nearest anchor + held interiors (actorutil), not just the player: on a sim peer

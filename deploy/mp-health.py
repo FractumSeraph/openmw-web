@@ -35,11 +35,12 @@ def lines():
 
 ev = Counter(); warn = Counter(); sso_fail = Counter(); drops = Counter(); reaped = Counter()
 client_err = Counter(); peer_err = Counter(); accounts = set(); joined = set()
-path95, path_max, snaps, first_unheld = [], [], 0, 0
+path95, path_max, snaps, first_unheld, hold_capped = [], [], 0, 0, 0
 slow_reads = Counter()
 no_pose = Counter()  # windows with a drawn NPC that has no pose stream of its own (npcNoPose), by record
 facing_n = facing_bad = 0  # walking NPCs drawn >120 deg off the server's heading (180s)
 hitch = hitch_sfs = hidden_w = 0  # visible windows with a frame >= 500 ms; of those, >= 300 ms waiting on streamed reads
+hitch_pf = [0, 0]  # those windows' slow streamed reads: [named by the cell prefetch already, never named] (sfsSlowPf)
 rtt50, rtt95, switch_ms, self_snaps, play_s = [], [], [], 0, 0.0
 npc_worst = Counter()  # visible windows' worst-off NPC (>= 300 u): record (puppet | run locally)
 seen_session = set(); lua_errors = 0; err_sessions = defaultdict(set); data_setup = {}
@@ -85,9 +86,11 @@ for e in lines():
                 if wf and int(wf[1]) >= 500:
                     hitch += 1
                     if ss and int(ss[1]) >= 300: hitch_sfs += 1
+                    pf = re.search(r'sfsSlowPf=(\d+)/(\d+)', t)
+                    if pf: hitch_pf[0] += int(pf[1]); hitch_pf[1] += int(pf[2])
             mf = re.search(r'npcFacing bad=(\d+) n=(\d+)', t)
             if mf: facing_bad += int(mf[1]); facing_n += int(mf[2])
-            if s not in seen_session:
+            if s not in seen_session and ' settling=1' not in t and ' chargen=1' not in t:
                 seen_session.add(s)
                 if f(t, 'holder') == 'none' and f(t, 'cell') not in (None, '?'): first_unheld += 1
             # A background tab runs no frames while poses keep arriving: its puppets read as off
@@ -96,9 +99,11 @@ for e in lines():
             np = f(t, 'npcNoPose')
             if np and np.isdigit() and int(np):
                 for rec in (f(t, 'noPoseRec') or '?').split(','): no_pose[rec] += 1
-        elif t.startswith('[boot] ') and 'switchMs=' in t:
+        elif t.startswith('[boot] '):
             v = f(t, 'switchMs')  # click -> playable in the destination world (index.html)
             if v and v.isdigit(): switch_ms.append(int(v))
+            # The settle hold let the player in on its +10 s cap, the cell still unheld (index.html).
+            if f(t, 'holdCapped'): hold_capped += 1
         elif 'SELF SNAP' in t:
             self_snaps += 1
         elif t.startswith('[sfs] slow read '):
@@ -121,13 +126,15 @@ print(f"sign-ins refused:\n{top(sso_fail)}")
 print(f"worlds reaped:\n{top(reaped)}")
 print(f"stuck on the loading screen 5 min (settle timeout): {sum(v for k, v in client_err.items() if 'settle hold released' in k)}")
 print(f"smoothness: NPC path p95 per 5 s window -- median {q(path95, .5)}, p90 {q(path95, .9)}, p99 {q(path95, .99)}, max {q(path_max, 1)} u"
-      f" ({len(path95)} windows) | snaps {snaps} | sessions whose first window was unheld {first_unheld}")
+      f" ({len(path95)} windows) | snaps {snaps} | sessions whose first window was unheld {first_unheld}"
+      f" | let in unheld on the hold's cap {hold_capped}")
 print(f"network: round trip (server-measured) median p50 {q(rtt50, .5)} ms, p95 of p95s {q(rtt95, .95)} ms ({len(rtt50)} samples)"
       f" | own body pulled back (SELF SNAP) {self_snaps} = {self_snaps / max(play_s / 3600, 1e-9):.1f}/h over {play_s / 3600:.1f} h played")
 print(f"world switches: click to playable p50 {q(switch_ms, .5)} ms, p95 {q(switch_ms, .95)} ms ({len(switch_ms)} switches)")
 print(f"NPCs drawn 300 u+ off their server path, worst per visible 5 s window:\n{top(npc_worst, 8)}")
 print(f"NPCs drawn with no pose stream of their own (5 s windows, by record):\n{top(no_pose, 6)}")
-print(f"hitches: {hitch} visible windows with a frame of 500 ms or more, {hitch_sfs} of them waiting 300 ms+ on streamed game files | {hidden_w} windows in a background tab (not counted)")
+print(f"hitches: {hitch} visible windows with a frame of 500 ms or more, {hitch_sfs} of them waiting 300 ms+ on streamed game files"
+      f" (their slow reads: {hitch_pf[0]} already named by the cell prefetch, {hitch_pf[1]} never named) | {hidden_w} windows in a background tab (not counted)")
 print(f"facing: walking NPCs drawn turned round (>120 deg off the server) {facing_bad}/{facing_n} samples" + (f" ({100 * facing_bad / facing_n:.1f}%)" if facing_n else ''))
 print(f'Lua errors (peer + clients): {lua_errors}')
 print(f"sim peer start failures: {ev['simpeer.start_timeout']}   peer errors:\n{top(peer_err, 8)}")

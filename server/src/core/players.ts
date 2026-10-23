@@ -94,6 +94,9 @@ export interface Player {
   // Wall-clock of the peer's newest avatar-bars report for this player; while fresh the
   // client's own PlayerStatsDynamic assertion is ignored (Phase 4A one-writer rule).
   peerStatsAt?: number;
+  // When this player's last PlayerDeath was refused (peer says alive): a second refusal stands
+  // the client back up instead of leaving it a corpse (playerstate.ts PlayerDeath).
+  deathRefusedAt?: number;
   // Wall-clock of the peer's newest avatar item-state (wear/charge/soul) report; while fresh
   // the client's own itemStates (inside PlayerInventory) are ignored -- counts still land.
   peerItemStatesAt?: number;
@@ -170,6 +173,7 @@ export interface Player {
   peerPoseAt?: number;
   poseVersion: number;
   poseSentVersion?: number; // poseVersion as of the last MoveBroadcaster tick (acceptPeerPose)
+  stateSent?: Buffer; // the last 0x0103 payload the tick sent this player (unchanged = not resent)
   // Phase 3.6: wall-clock of the last accepted pose, for the plausible-speed envelope.
   lastPoseAt?: number;
   /** CONSECUTIVE implausible speed WINDOWS. A single one is ordinary, so enforcement waits for

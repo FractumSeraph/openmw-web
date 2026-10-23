@@ -1319,6 +1319,9 @@ namespace MWMechanics
             neighbors.push_back(victim);
 
         int id = MWBase::Environment::get().getWorld()->getPlayer().getNewCrimeId();
+        // MP: the witnesses' crime id belongs to THIS avatar; its own payment calms them.
+        if (MWMP::isAvatar(player.getCellRef().getRefNum()))
+            MWMP::noteCrimeOffender(id, player.getCellRef().getRefNum());
 
         // What amount of provocation did this crime generate?
         // Controls whether witnesses will engage combat with the criminal.
@@ -1377,7 +1380,10 @@ namespace MWMechanics
 
             bool isActorGuard = actor.getClass().isClass(actor, "guard");
 
-            int currentDisposition = getDerivedDisposition(actor);
+            // MP: the witness's feelings toward the AVATAR that did it. Never the dummy itself:
+            // an explicit `toward` reads the avatar registry's bounty, which is 0 for getPlayer().
+            int currentDisposition = getDerivedDisposition(
+                actor, MWMP::isAvatar(player.getCellRef().getRefNum()) ? player : MWWorld::Ptr());
 
             bool isPermanent = false;
             bool applyOnlyIfHostile = false;
@@ -1448,6 +1454,11 @@ namespace MWMechanics
                 if (!observerStats.getAiSequence().isInPursuit())
                 {
                     observerStats.getAiSequence().stack(AiPursue(player), actor);
+                    // Multiplayer client: the guard here is an AI-off puppet, so the arrest
+                    // never ran. Claimed to the holder as a pursuit (scripts/mp crimepursue).
+                    if (MWMP::isClient() && player == getPlayer() && actor.isInCell())
+                        MWMP::recordScriptNote({ "crimepursue", actor.getCellRef().getRefNum(), false, {}, 1,
+                            MWMP::cellKeyOf(*actor.getCell()) });
                 }
             }
             else
@@ -1507,6 +1518,22 @@ namespace MWMechanics
         if (reported)
         {
             const ESM::RefNum offender = player.getCellRef().getRefNum();
+            // Before the avatar branch returns (1.7.0): an avatar's victim fights back and
+            // remembers the crime id too, or paying the fine never calmed it.
+            if (type == OT_Assault && !victim.isEmpty()
+                && !victim.getClass().getCreatureStats(victim).getAiSequence().isInCombat(player)
+                && victim.getClass().isNpc())
+            {
+                // Attacker is in combat with us, but we are not in combat with the attacker yet. Time to fight back.
+                // Note: accidental or collateral damage attacks are ignored.
+                if (!victim.getClass().getCreatureStats(victim).getAiSequence().isInPursuit())
+                    startCombat(victim, player, &playerFollowers);
+
+                // Set the crime ID, which we will use to calm down participants
+                // once the bounty has been paid.
+                victim.getClass().getNpcStats(victim).setCrimeId(id);
+            }
+
             if (MWMP::isAvatar(offender))
             {
                 // The bounty belongs to the owner's client; the peer records the increment for
@@ -1545,20 +1572,6 @@ namespace MWMechanics
                 {
                     player.getClass().getNpcStats(player).expell(factionId, true);
                 }
-            }
-
-            if (type == OT_Assault && !victim.isEmpty()
-                && !victim.getClass().getCreatureStats(victim).getAiSequence().isInCombat(player)
-                && victim.getClass().isNpc())
-            {
-                // Attacker is in combat with us, but we are not in combat with the attacker yet. Time to fight back.
-                // Note: accidental or collateral damage attacks are ignored.
-                if (!victim.getClass().getCreatureStats(victim).getAiSequence().isInPursuit())
-                    startCombat(victim, player, &playerFollowers);
-
-                // Set the crime ID, which we will use to calm down participants
-                // once the bounty has been paid.
-                victim.getClass().getNpcStats(victim).setCrimeId(id);
             }
         }
 
@@ -1610,7 +1623,7 @@ namespace MWMechanics
                     // Force friendly actors into combat to prevent infighting between followers
                     for (const auto& follower : cachedAllies.getActorsSidingWith(target))
                     {
-                        if (follower != attacker && follower != player)
+                        if (follower != attacker && !isPlayerOrAvatar(follower))
                             startCombat(follower, attacker, &attackerAllies);
                     }
                 }
@@ -1658,12 +1671,20 @@ namespace MWMechanics
         bool canCommit = (attacker == player || attackerIsAvatar) && canCommitCrimeAgainst(victim, attacker);
 
         // For now we report only about crimes of player and player's followers
+        MWWorld::Ptr offender = attackerIsAvatar ? attacker : player;
         if (attacker != player && !attackerIsAvatar)
         {
             std::set<MWWorld::Ptr> playerFollowers;
             getActorsSidingWith(player, playerFollowers);
             if (playerFollowers.find(attacker) == playerFollowers.end())
-                return;
+            {
+                // MP: an AVATAR's companion -- the peer's dummy has none. Its kill is its
+                // leader's crime, committed as that avatar so the bounty reaches the owner.
+                const MWWorld::Ptr leader = getPlayerLeader(attacker);
+                if (leader.isEmpty() || leader == player)
+                    return;
+                offender = leader;
+            }
         }
 
         if (!canCommit && victimStats.getCrimeId() == -1)
@@ -1672,7 +1693,7 @@ namespace MWMechanics
         // Simple check for who attacked first: if the player attacked first, a crimeId should be set
         // Doesn't handle possible edge case where no one reported the assault, but in such a case,
         // for bystanders it is not possible to tell who attacked first, anyway.
-        commitCrime(attackerIsAvatar ? attacker : player, victim, MWBase::MechanicsManager::OT_Murder);
+        commitCrime(offender, victim, MWBase::MechanicsManager::OT_Murder);
     }
 
     bool MechanicsManager::awarenessCheck(const MWWorld::Ptr& ptr, const MWWorld::Ptr& observer, bool useCache)

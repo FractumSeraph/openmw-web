@@ -78,6 +78,19 @@ namespace MWMP
     /** Forget every avatar — session loss, world switch. */
     void clearAvatars();
 
+    /** WHOSE CRIME A WITNESS REMEMBERS. Witness crime ids come from the one counter on the
+     *  peer's dummy, and the "paid" mark was the dummy's too: one avatar paying a fine calmed
+     *  the witnesses of every other avatar's crimes. The crime id is tied to its offender here
+     *  and each avatar keeps its own paid mark. Only avatars are noted; the local player keeps
+     *  the vanilla NpcStats mark. */
+    void noteCrimeOffender(int crimeId, ESM::RefNum offender);
+    /** The avatar a crime id belongs to; an unset RefNum when it is not an avatar's. */
+    ESM::RefNum crimeOffender(int crimeId);
+    /** The last crime id that avatar has paid for, -1 when none. */
+    int avatarPaidCrimeId(ESM::RefNum avatar);
+    /** That avatar paid: every crime id noted for it so far counts as settled. */
+    void recordAvatarCrimePaid(ESM::RefNum avatar);
+
     /** THE LEADER'S LEVEL SCALES THE WORLD. Levelled lists on the sim peer used to roll against
      *  the nearest avatar, so a level-3 friend helping a level-20 host met level-3 creatures
      *  wherever THEY stood -- the host's game got easier around the helper. Set from the world
@@ -182,6 +195,10 @@ namespace MWMP
      *  takes it and claims it as hp.fall, which the server subtracts from the avatar. */
     void recordFall(float healthLost);
     float takeFall();
+    // ...and a fall that knocked the owner down: the avatar must lie down too, or NPCs fight a
+    // standing body (no knocked-down hit bonus, it can still block). Sticky until taken.
+    void recordFallKnockdown();
+    bool takeFallKnockdown();
 
     /** A multiplayer CLIENT (a browser engine with a session URL), as opposed to the sim peer
      *  (OPENMW_MP_SYSTEM) or singleplayer (no URL). Read once: the environment never changes. */

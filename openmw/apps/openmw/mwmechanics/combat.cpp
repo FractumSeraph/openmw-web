@@ -662,7 +662,7 @@ namespace MWMechanics
         if (actor.getClass().isNpc() && target.getClass().isNpc())
         {
             if (target.getClass().getNpcStats(target).isWerewolf()
-                || (target == getPlayer()
+                || (isPlayerOrAvatar(target)
                     && MWBase::Environment::get().getWorld()->getGlobalInt(MWWorld::Globals::sPCKnownWerewolf)))
             {
                 const ESM::GameSetting* iWerewolfFightMod
@@ -852,8 +852,9 @@ namespace MWMechanics
 
     bool friendlyHit(const MWWorld::Ptr& attacker, const MWWorld::Ptr& target, bool complain)
     {
-        const MWWorld::Ptr& player = getPlayer();
-        if (attacker != player)
+        // MP: an avatar striking its own companion is a friendly hit too (the peer's dummy
+        // has no companions; the avatars do).
+        if (!isPlayerOrAvatar(attacker))
             return false;
 
         std::set<MWWorld::Ptr> followersAttacker;

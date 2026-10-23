@@ -302,6 +302,11 @@ function handleStatsDynamic(ctx: StateCtx, player: Player, body: LTable): boolea
     // never falls by itself, so without this a long fall cost nothing. A LOSS only, capped at
     // the bar: the one thing a modified client can do with it is hurt itself.
     const fallLoss = ctx.clientAuthority ? finite(tbl(body.get('hp'))?.get('fall')) : undefined;
+    // ...and the fall knocked the owner down: lay the avatar down too (a fact about the owner's
+    // own body, harmless to forge). Its own event: it may come with no bar change at all.
+    if (ctx.clientAuthority && tbl(body.get('hp'))?.get('kd') === true && player.avatarDead !== true) {
+      ctx.worldPeer()?.peer.sendEvent('AvatarRestore', { id: player.id, kd: true });
+    }
     if (fallLoss !== undefined && fallLoss > 0 && cur?.hp && !(player.avatarDead === true && cur.hp.c <= 0)) {
       const base = r.hp ?? { c: cur.hp.c, b: cur.hp.b };
       r.hp = { c: Math.max(0, base.c - Math.min(fallLoss, base.b)), b: base.b };
@@ -1158,6 +1163,17 @@ export function handleStateEvent(ctx: StateCtx, player: Player, name: string, va
       if (hp !== undefined && hp > 0) {
         log('warn', 'state.death_unconfirmed', { from: player.name, hp });
         ctx.noteAnomaly?.(player.accountKey, 'death_unconfirmed');
+        // STILL ALIVE BY THE PEER'S WORD, AGAIN: the client died of something the peer never
+        // simulated, and its 5 s resend was refused forever -- a corpse with healthy bars. The
+        // first refusal waits (the peer's own 0 may simply be late); the next stands it back up
+        // where it lies, at the peer's health (no teleport, no refill).
+        const now = Date.now();
+        if (player.deathRefusedAt !== undefined && now - player.deathRefusedAt <= 15000) {
+          player.peer.sendEvent('PlayerResurrect', { restoreHp: false, standUp: true, hp });
+          player.deathRefusedAt = undefined;
+        } else {
+          player.deathRefusedAt = now;
+        }
         return true;
       }
     }

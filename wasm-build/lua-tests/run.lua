@@ -1884,7 +1884,7 @@ do
   -- #146: a witness that picked a fight on the thief's client is claimed to the holder.
   check("a client's crime-combat witness is claimed as ActorAI combat+crime and the server admits it",
     mm:find('MWMP::recordScriptNote({ "crimecombat"', 1, true) ~= nil
-    and ac:find('combat = me, crime = true }, obj)', 1, true) ~= nil
+    and ac:find('combat = me, crime = true,', 1, true) ~= nil
     and ws:find("const crime = body.get('crime') === true;", 1, true) ~= nil
     and ws:find('(!crime && this.dialogueHolder?.(ref.key) !== player.id)', 1, true) ~= nil)
 end
@@ -4131,7 +4131,7 @@ end
 print('identity.lua -- the fall damage the engine did not apply is claimed as hp.fall (prod 2026-10-23)')
 do
   local id = io.open('./openmw/files/data/scripts/mp/identity.lua'):read('*a')
-  local a = id:find('local fall = { owed = 0 }', 1, true)
+  local a = id:find('local fall = { owed = 0, kd = false }', 1, true)
   local b = a and select(2, id:find('\nfunction identity.fallWatch()', a, true))
   b = b and select(2, id:find('\nend\n', b, true))
   local owed = {}
@@ -4190,7 +4190,7 @@ do
   check('placement passes no rotation (a yaw-only transform zeroed the pitch)',
     g:find("obj:teleport(inviteCellArg(key), tgt, { onGround = false })", 1, true) ~= nil
     and not g:find('rotation = util.transform.rotateZ(e.yaw or 0), onGround = false', 1, true))
-  check('puppet records carry no template mwscript', g:find("local draft = { template = template, name = name, mwscript = '' }", 1, true) ~= nil)
+  check('puppet records carry no template mwscript', g:find("local draft = { template = template, name = name, mwscript = '', model = '' }", 1, true) ~= nil)
   check('a paralyzed avatar stops its owner (kd)', g:find("getEffect('paralyze')", 1, true) ~= nil)
   local av = io.open('./openmw/files/data/scripts/mp/avatar.lua'):read('*a')
   local a = av:find('local placedFatigue = {}', 1, true)
@@ -4240,6 +4240,319 @@ do
   local mm = io.open('./openmw/apps/openmw/mwmechanics/mechanicsmanagerimp.cpp'):read('*a')
   check('a guard fighting an avatar keeps at it, and only its own pursuers join',
     mm:find('if (MWMechanics::isPlayerOrAvatar(target))', 1, true) ~= nil and mm:find('aiSeq.getActivePackage().getTarget() == target', 1, true) ~= nil)
+end
+
+-- ====================================== 1.7.0 B: NPC and creature sync (2026-10-23)
+print('1.7.0 sync -- re-attach race, creature top speed, snap facing, orphans, beast skeleton, refused death')
+do
+  local M = './openmw/files/data/scripts/mp/'
+  local g = io.open(M .. 'global.lua'):read('*a')
+  local a = io.open(M .. 'actors.lua'):read('*a')
+  local pu = io.open(M .. 'puppet.lua'):read('*a')
+  local ob = io.open(M .. 'objects.lua'):read('*a')
+  local pl = io.open(M .. 'player.lua'):read('*a')
+  local det = g:find('mpPuppetDetached = function(data)', 1, true)
+  local keep = det and g:find('if obj and obj:isValid() and actors.isPuppetedActor(obj) then return end', det, true)
+  local rm = det and g:find("pcall(obj.removeScript, obj, 'scripts/mp/puppet.lua')", det, true)
+  check('a re-attached puppet keeps its script (the detach hop checks first)', keep ~= nil and rm ~= nil and keep < rm)
+  check('each actor pose names its key', a:find('e.actorKey = key', 1, true) ~= nil)
+  check('a pose re-arms a puppet detached a moment ago',
+    pu:find('if degraded or (actorKey == nil and playerId == nil and e.actorKey ~= nil) then', 1, true) ~= nil
+    and pu:find('actorKey = actorKey or degradedKey or e.actorKey', 1, true) ~= nil)
+  check('a creature puppet steers by its max speed (fly/swim)', pu:find('speedOf = types.Actor.getMaxSpeed', 1, true) ~= nil)
+  local ab = io.open('./openmw/apps/openmw/mwlua/types/actor.cpp'):read('*a')
+  check('types.Actor.getMaxSpeed is bound', ab:find('actor["getMaxSpeed"]', 1, true) ~= nil)
+  check('a snap request carries the yaw', pu:find('yaw = target.yaw, why = why', 1, true) ~= nil)
+  check('an actor snap keeps the facing', a:find("{ rotation = util.transform.rotateZ(pos.yaw) }", 1, true) ~= nil)
+  check('a count-0 actor (expired summon) is gone to the peer', a:find('if obj.count == 0 then', 1, true) ~= nil
+    and a:find('if obj and obj:isValid() and obj.count > 0 then', 1, true) ~= nil)
+  check('a full cell state drops named-actor copies it lacks (never on the peer)',
+    ob:find('if data.actorsComplete == true and data.cellKey and not (mp.isSystem and mp.isSystem()) then', 1, true) ~= nil)
+  local obb = io.open('./openmw/apps/openmw/mwlua/objectbindings.cpp'):read('*a')
+  check('a same-cell teleport does not re-add a running local script',
+    obb:find('!world->getLocalScripts().isRunning(script, newPtr)', 1, true) ~= nil)
+  check('a refused death stands up at the peer hp, baselined first',
+    pl:find('if hp then identity.notePeerBars(hp) end', 1, true) ~= nil and g:find('if not data.standUp then teleportPlayerTo(data) end', 1, true) ~= nil)
+  check('the probe marks bodies past processing range', a:find('> 7168 * 7168 or nil', 1, true) ~= nil)
+end
+
+-- ====================================== 1.7.0 D: stats counted once (2026-10-23)
+print('1.7.0 stats -- modifier moves and worn restores are the avatar\'s; rest fatigue is claimed; a fall knocks down')
+do
+  local id = io.open('./openmw/files/data/scripts/mp/identity.lua'):read('*a')
+  local a = id:find('local tracked = {', 1, true)
+  local b = a and select(2, id:find('\ntrackLocalChange = function()', a, true))
+  b = b and select(2, id:find('\nend\n', b, true))
+  local function mk(o)
+    local st = { health = { current = 50, base = 100, modifier = 0 }, magicka = { current = 40, base = 80, modifier = 0 },
+      fatigue = { current = 30, base = 200, modifier = 0 } }
+    local clock = { t = 0 }
+    local env = setmetatable({
+      identity = {}, self = {}, mp = {},
+      core = { getSimulationTime = function() return clock.t end, getRealTime = function() return clock.t end },
+      I = { UI = { getMode = function() return o.mode end } },
+      Actor = { stats = { dynamic = {
+        health = function() return st.health end, magicka = function() return st.magicka end, fatigue = function() return st.fatigue end } },
+        activeSpells = function() return o.spells or {} end },
+    }, { __index = _G })
+    local chunk = a and b and loadstring(id:sub(a, b) .. '\nreturn tracked, trackLocalChange')
+    if not chunk then return nil end
+    setfenv(chunk, env)
+    local tr, tick = chunk()
+    return tr, tick, st, clock
+  end
+  local tr, tick, st, clock = mk({})
+  check('trackLocalChange (1.7.0) is where this test expects it', tick ~= nil)
+  if tick then
+    tick()
+    st.health.current = 70; st.health.modifier = 20; tick()
+    check('a Fortify Health is not claimed as a heal (the avatar runs its copy)', tr.hp.delta == 0, tostring(tr.hp.delta))
+    st.health.current = 50; st.health.modifier = 0; tick()
+    check('...nor its expiry', tr.hp.delta == 0, tostring(tr.hp.delta))
+    st.health.current = 60; tick()
+    check('a real heal is still claimed', tr.hp.delta == 10, tostring(tr.hp.delta))
+    st.magicka.current = 30; st.magicka.modifier = -10; tick()
+    check('a Drain Magicka is not claimed as a spend', tr.mp.delta == 0, tostring(tr.mp.delta))
+    st.fatigue.current = 60; tick()
+    check('fatigue regen out of rest is not claimed', tr.ft.delta == 0, tostring(tr.ft.delta))
+  end
+  tr, tick, st, clock = mk({ mode = 'Rest' })
+  if tick then
+    tick(); st.fatigue.current = 90; tick()
+    check('fatigue a rest restored is claimed', tr.ft.delta == 60, tostring(tr.ft.delta))
+  end
+  local ring = { { fromEquipment = true, effects = { { id = 'restorehealth', magnitudeThisFrame = 2 } } } }
+  tr, tick, st, clock = mk({ spells = ring })
+  if tick then
+    tick(); clock.t = 5; st.health.current = 60; tick()
+    check('a worn Restore Health ring\'s regen is the avatar\'s, not claimed again', math.abs(tr.hp.delta) < 1e-6, tostring(tr.hp.delta))
+    clock.t = 6; st.health.current = 80; tick()
+    check('a potion on top of it still counts', math.abs(tr.hp.delta - 18) < 1e-6, tostring(tr.hp.delta))
+  end
+  -- the fall's knockdown
+  local fa = id:find('local fall = { owed = 0, kd = false }', 1, true)
+  local fb = fa and select(2, id:find('\nfunction identity.fallWatch()', fa, true))
+  fb = fb and select(2, id:find('\nend\n', fb, true))
+  local kds = { false, true }
+  local fenv = setmetatable({ identity = {}, mp = { takeFallDamage = function() return 0 end,
+    takeFallKnockdown = function() return table.remove(kds, 1) end } }, { __index = _G })
+  local fchunk = fa and fb and loadstring(id:sub(fa, fb) .. '\nreturn identity')
+  if fchunk then
+    setfenv(fchunk, fenv)
+    local F = fchunk()
+    F.fallWatch(); check('no knockdown, none owed', F._fall.kd == false)
+    F.fallWatch(); check('the engine\'s fall knockdown is taken', F._fall.kd == true)
+  end
+  check('the claim carries the knockdown', id:find('if fall.kd then claim.hp.kd = true end', 1, true) ~= nil)
+  local ch = io.open('./openmw/apps/openmw/mwmechanics/character.cpp'):read('*a')
+  check('character.cpp records a fall knockdown for the avatar', ch:find('MWMP::recordFallKnockdown();', 1, true) ~= nil)
+  local lb = io.open('./openmw/apps/openmw/mwmp/luabindings.cpp'):read('*a')
+  check('mp.takeFallKnockdown and mp.setKnockedDown are bound', lb:find('api["takeFallKnockdown"]', 1, true) ~= nil and lb:find('api["setKnockedDown"]', 1, true) ~= nil)
+  local g = io.open('./openmw/files/data/scripts/mp/global.lua'):read('*a')
+  check('the peer lays the avatar down on kd', g:find('if data.kd == true and mp.setKnockedDown then pcall(mp.setKnockedDown, p.obj) end', 1, true) ~= nil)
+end
+
+-- ====================================== the dummy player's rules (1.7.0)
+print('dummy-player fixes -- the peer\'s getPlayer() is nobody; rules reach the real player')
+do
+  local function src(p) return io.open(p):read('*a') end
+  local ENG = './openmw/apps/openmw/'
+  local g = src('./openmw/files/data/scripts/mp/global.lua')
+  local ax = src(ENG .. 'mwscript/aiextensions.cpp')
+  check('scripted StartCombat Player on a puppet is noted (scriptcombat)',
+    ax:find('"scriptcombat"', 1, true) ~= nil and ax:find('MWMP::isPuppet(actor.getCellRef().getRefNum())', 1, true) ~= nil)
+  check('scriptcombat is claimed like crimecombat', g:find("n.kind == 'crimecombat' or n.kind == 'scriptcombat'", 1, true) ~= nil)
+
+  -- 2. a guard's pursuit for a small crime
+  local mm = src(ENG .. 'mwmechanics/mechanicsmanagerimp.cpp')
+  check('a stacked AiPursue on a client is noted (crimepursue)', mm:find('"crimepursue"', 1, true) ~= nil)
+  check('crimepursue is claimed with pursue = true', g:find('actors.noteCrimeCombat(n, true)', 1, true) ~= nil)
+  local al = src('./openmw/files/data/scripts/mp/actors.lua')
+  check('MP_ActorAI starts Pursue for a pursue claim', al:find("type = pursue and 'Pursue' or 'Combat'", 1, true) ~= nil)
+  check('omw/ai.lua lets Pursue target an avatar (an NPC)',
+    src('./openmw/files/data/scripts/omw/ai.lua'):find('if not types.NPC.objectIsInstance(args.target) then error("target must be a player")', 1, true) ~= nil)
+  local ap = src(ENG .. 'mwmechanics/aipursue.cpp')
+  check('the peer waits for the avatar\'s CrimeUpdate before dropping the chase',
+    ap:find('if (targetIsAvatar && mAvatarBountyGrace > 0.f)', 1, true) ~= nil and ap:find('mAvatarBountyGrace = 0.f;', 1, true) ~= nil)
+  do -- behaviour: noteCrimeCombat's body
+    local a = al:find('\nfunction actors.noteCrimeCombat(n, pursue)', 1, true)
+    local b = a and select(2, al:find('\nend\n', a, true))
+    local sent = {}
+    local env = setmetatable({
+      actors = { epochOf = function() return 7 end }, held = {},
+      deps = { ownIdFn = function() return 42 end },
+      withAddr = function(t) return t end,
+      mp = { sendEvent = function(name, body) sent[#sent + 1] = { name, body } end },
+    }, { __index = _G })
+    local chunk = a and b and loadstring(al:sub(a, b))
+    check('noteCrimeCombat (pursue version) is where this test expects it', chunk ~= nil)
+    if chunk then
+      setfenv(chunk, env); chunk()
+      local obj = { isValid = function() return true end }
+      env.actors.noteCrimeCombat({ ref = obj, cellKey = 'balmora' }, true)
+      env.actors.noteCrimeCombat({ ref = obj, cellKey = 'balmora' })
+      check('a pursue claim names us, is a crime and asks for Pursue',
+        sent[1] and sent[1][2].combat == 42 and sent[1][2].crime == true and sent[1][2].pursue == true)
+      check('a combat claim carries no pursue', sent[2] and sent[2][2].pursue == nil)
+      env.held.balmora = { epoch = 1 }
+      env.actors.noteCrimeCombat({ ref = obj, cellKey = 'balmora' }, true)
+      check('no claim for a cell we hold ourselves', #sent == 2)
+    end
+  end
+
+  -- 3. a relayed fight on an avatar goes through startCombat
+  local ls = src(ENG .. 'mwlua/localscripts.cpp')
+  check('_startAiCombat on an avatar calls MechanicsManager::startCombat',
+    ls:find('if (MWMP::isAvatar(target.ptr().getCellRef().getRefNum()))', 1, true) ~= nil
+    and ls:find('getMechanicsManager()->startCombat(ptr, target.ptr(), nullptr);', 1, true) ~= nil
+    and ls:find('#include "../mwmp/puppets.hpp"', 1, true) ~= nil)
+
+  -- 4. a paid crime is per avatar
+  local ac = src(ENG .. 'mwmechanics/actors.cpp')
+  local pc = src(ENG .. 'mwmp/puppets.cpp')
+  local lb = src(ENG .. 'mwmp/luabindings.cpp')
+  check('reportCrime and the guard pursuit tie the crime id to the avatar',
+    mm:find('MWMP::noteCrimeOffender(id, player.getCellRef().getRefNum());', 1, true) ~= nil
+    and ac:find('MWMP::noteCrimeOffender(crimeId, criminal.getCellRef().getRefNum());', 1, true) ~= nil)
+  check('a witness compares against its offender\'s own paid id',
+    ac:find('paidCrimeId = std::max(paidCrimeId, MWMP::avatarPaidCrimeId(offender));', 1, true) ~= nil
+    and ac:find('if (npcStats.getCrimeId() <= paidCrimeId)', 1, true) ~= nil)
+  check('puppets.cpp keeps per-avatar crime marks and clears them with the avatars',
+    pc:find('void recordAvatarCrimePaid(ESM::RefNum avatar)', 1, true) ~= nil and pc:find('crimeMarks().clear();', 1, true) ~= nil)
+  check('mp.recordCrimePaid(obj) pays one avatar, no argument the shared mark',
+    lb:find('recordAvatarCrimePaid(who->as<MWLua::Object>().id());', 1, true) ~= nil
+    and lb:find('getPlayer().recordCrimeId();', 1, true) ~= nil)
+  do -- behaviour: the peer's CrimeUpdate pays the named avatar only
+    package.loaded['scripts.mp.quests'] = nil
+    local qenv = stubs.install({})
+    qenv.mp.isSystem = function() return true end
+    local paid = {}
+    qenv.mp.recordCrimePaid = function(o) paid[#paid + 1] = o or 'shared' end
+    qenv.mp.setAvatarBounty = function() end
+    local q = require('scripts.mp.quests')
+    local av = { isValid = function() return true end }
+    q.init({ playerFn = function() return nil end, avatarObjFn = function(id) return id == 5 and av or nil end,
+      allAvatarsFn = function() return { av } end, ownIdFn = function() return nil end })
+    q.handlers.MP_CrimeUpdate({ bounty = 40, byId = 5 })
+    q.handlers.MP_CrimeUpdate({ bounty = 0, byId = 5 })
+    check('a named player\'s paid fine settles only their avatar', #paid == 1 and paid[1] == av, tostring(paid[1]))
+    q.handlers.MP_CrimeUpdate({ bounty = 40, shared = true })
+    q.handlers.MP_CrimeUpdate({ bounty = 0, shared = true })
+    check('a shared fine still settles everything', #paid == 2 and paid[2] == 'shared', tostring(paid[2]))
+    package.loaded['scripts.mp.quests'] = nil
+  end
+
+  -- 5. guards defend players against creatures
+  check('a guard measures a creature against the player it fights, not the dummy',
+    ac:find('getCombatTarget(combatTarget) && isPlayerOrAvatar(combatTarget)', 1, true) ~= nil
+    and ac:find('getFightTerm(actor2, creatureFoe) >= 100', 1, true) ~= nil
+    and not ac:find('getFightTerm(actor2, player) >= 100', 1, true))
+
+  -- 6. a magic kill is murder
+  local au = src(ENG .. 'mwmechanics/actorutil.cpp')
+  check('getPlayerLeader reads the first side-with package aimed at a player or avatar',
+    au:find('MWWorld::Ptr getPlayerLeader(const MWWorld::Ptr& actor)', 1, true) ~= nil
+    and au:find('if (!package->sideWithTarget())', 1, true) ~= nil and au:find('if (isPlayerOrAvatar(target))', 1, true) ~= nil)
+  check('an avatar\'s (or its companion\'s) killing spell reaches actorKilled as the caster',
+    ac:find('const bool casterIsPlayer = isPlayerOrAvatar(caster);', 1, true) ~= nil
+    and ac:find('creature, casterIsPlayer || !casterFollowsPlayer ? caster : player);', 1, true) ~= nil
+    and not ac:find('if (caster == player || playerFollowers.find(caster) != playerFollowers.end())', 1, true))
+
+  -- 7. companions
+  mm = src(ENG .. 'mwmechanics/mechanicsmanagerimp.cpp')
+  local cb = src(ENG .. 'mwmechanics/combat.cpp')
+  check('friendlyHit applies to an avatar striking its companion', cb:find('if %(!isPlayerOrAvatar%(attacker%)%)\r?\n%s*return false;') ~= nil)
+  check('a companion\'s kill is committed as its leader',
+    mm:find('const MWWorld::Ptr leader = getPlayerLeader(attacker);', 1, true) ~= nil
+    and mm:find('commitCrime(offender, victim, MWBase::MechanicsManager::OT_Murder);', 1, true) ~= nil)
+  check('allies joining a fight never include a player or avatar', mm:find('if (follower != attacker && !isPlayerOrAvatar(follower))', 1, true) ~= nil)
+
+  -- 8. crime disposition and calming
+  mm = src(ENG .. 'mwmechanics/mechanicsmanagerimp.cpp')
+  check('a witness\'s disposition is toward the avatar, never the dummy passed explicitly',
+    mm:find('actor, MWMP::isAvatar(player.getCellRef().getRefNum()) ? player : MWWorld::Ptr());', 1, true) ~= nil)
+  do
+    local victimAt = mm:find('victim.getClass().getNpcStats(victim).setCrimeId(id);', 1, true)
+    local avatarAt = mm:find('if (MWMP::isAvatar(offender))', 1, true)
+    local reportedAt = mm:find('const ESM::RefNum offender = player.getCellRef().getRefNum();', 1, true)
+    check('the victim fights back and keeps the crime id before the avatar branch returns',
+      victimAt and avatarAt and reportedAt and reportedAt < victimAt and victimAt < avatarAt
+      and select(2, mm:gsub('victim%.getClass%(%)%.getNpcStats%(victim%)%.setCrimeId%(id%);', '')) == 1)
+  end
+
+  -- 9. the interior range check on the peer
+  local at = src(ENG .. 'mwlua/types/actor.cpp')
+  check('isInActorsProcessingRange skips the worldspace check when sim anchors exist',
+    at:find('if (MWBase::Environment::get().getWorld()->getSimAnchorPositions().empty()\r\n                && target.getCell()->getCell()->getWorldSpace()', 1, true) ~= nil
+    or at:find('if (MWBase::Environment::get().getWorld()->getSimAnchorPositions().empty()\n                && target.getCell()->getCell()->getWorldSpace()', 1, true) ~= nil)
+
+  -- 10. Command and AvoidDoor
+  check('Command cannot take an avatar', src(ENG .. 'mwmechanics/spelleffects.cpp'):find('!caster.getClass().isActor() || MWMechanics::isPlayerOrAvatar(target)', 1, true) ~= nil)
+  check('AvoidDoor never stacks on an avatar', src(ENG .. 'mwmechanics/aiavoiddoor.cpp'):find('if (MWMechanics::isPlayerOrAvatar(neighbor))', 1, true) ~= nil)
+
+  -- 11. werewolves
+  ac = src(ENG .. 'mwmechanics/actors.cpp')
+  check('PCKnownWerewolf applies to an avatar target', src(ENG .. 'mwmechanics/combat.cpp'):find('|| (isPlayerOrAvatar(target)', 1, true) ~= nil)
+  check('the guard pursuit skips a werewolf avatar',
+    ac:find('if (body.getClass().isNpc() && body.getClass().getNpcStats(body).isWerewolf())', 1, true) ~= nil)
+
+  -- 12. the peer never names itself as a combat target
+  g = src('./openmw/files/data/scripts/mp/global.lua')
+  do
+    local a = g:find('playerIdOf = function(obj)', 1, true)
+    local guard = a and g:find('if not (mp.isSystem and mp.isSystem()) then', a, true)
+    local loop = a and g:find('for _, pl in ipairs(world.players) do', a, true)
+    check('playerIdOf skips world.players on the sim peer', guard and loop and guard < loop and guard - a < 400)
+  end
+end
+
+print('1.7.0 NPC poses carry the peer sample time: interp.lua interpolates on it, and falls back to arrival without it')
+do
+  package.loaded['scripts.mp.interp'] = nil
+  local Interp = dofile('./openmw/files/data/scripts/mp/interp.lua')
+  -- The peer makes a pose every 50 ms; the link adds 20 ms plus 0/40 ms of jitter.
+  local function feed(stamped, base)
+    local it, prevA = Interp.new(), 0
+    for i = 1, 80 do
+      local made = i * 0.05
+      local a = math.max(made + 0.02 + ((i % 2 == 0) and 0.04 or 0), prevA + 0.004)
+      prevA = a
+      it:push({ t = a, x = 0, y = made * 140, z = 0, yaw = 0, pitch = 0, flags = 1,
+        st = stamped and ((base + i * 50) % 65536) or nil })
+    end
+    return it
+  end
+  local it = feed(true, 0)
+  local worst, late = 0, false
+  for i = 2, #it.buf do
+    worst = math.max(worst, math.abs((it.buf[i].t - it.buf[i - 1].t) - 0.05))
+    if it.buf[i].t > it.buf[i].at + 1e-9 then late = true end
+  end
+  check('stamped samples are spaced as they were MADE (50 ms), not as they arrived', worst < 0.002, string.format('%.4f', worst))
+  check('a stamped sample is never timed after its own arrival', not late)
+  local wrap = feed(true, 65536 - 40 * 50)
+  local wworst = 0
+  for i = 2, #wrap.buf do wworst = math.max(wworst, math.abs((wrap.buf[i].t - wrap.buf[i - 1].t) - 0.05)) end
+  check('the u16 stamp wrapping at 65536 ms is not a gap', wworst < 0.002, string.format('%.4f', wworst))
+  local old = feed(false, 0)
+  check('no stamp (an older peer): the arrival-time path, unchanged', old.buf[#old.buf].su == nil and old.buf[#old.buf].st == nil)
+  local function worstSpeed(s)
+    local w = 0
+    local t0 = s.buf[#s.buf].at - 0.55 -- the 16-sample buffer holds the last ~0.8 s
+    for f = 0, 24 do
+      local now = t0 + f / 60
+      s:target(now) -- as the puppet does each frame: settles the delay in use
+      w = math.max(w, math.abs(s:speed(now) - 140))
+    end
+    return w
+  end
+  check('the rendered NPC speed is steadier on sample time than on arrival time',
+    worstSpeed(feed(true, 0)) < worstSpeed(feed(false, 0)),
+    string.format('%.1f vs %.1f u/s', worstSpeed(feed(true, 0)), worstSpeed(feed(false, 0))))
+  local re = feed(true, 0)
+  re:push({ t = re.buf[#re.buf].at + 0.05, x = 0, y = 0, z = 0, yaw = 0, pitch = 0, flags = 0, st = re.buf[#re.buf].st })
+  check('a repeated stamp re-bases instead of stacking two samples on one instant',
+    re.buf[#re.buf].t > re.buf[#re.buf - 1].t)
 end
 
 print(string.format('\n%d passed, %d failed', pass, fail))

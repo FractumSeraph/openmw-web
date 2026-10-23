@@ -500,7 +500,10 @@ local function puppetRecordId(id, name)
     -- mwscript '': the template's own script (a villager's, or retail's first NPC record's) ran
     -- on every puppet, and on the avatar it restarted with reset locals at every placement
     -- (a same-cell teleport re-adds the local script, objectbindings.cpp).
-    local draft = { template = template, name = name, mwscript = '' }
+    -- model '': no skeleton of the template's. Its base_anim.nif overrode the race's own pick
+    -- (npcanimation.cpp: a set model wins), so a Khajiit or Argonian friend had no Tail node
+    -- ("Error adding NPC part: Can't find attachment node Tail"). Empty = chosen by race and sex.
+    local draft = { template = template, name = name, mwscript = '', model = '' }
     if app then
         draft.race = app.race
         draft.class = app.class
@@ -1261,8 +1264,11 @@ local function scriptNotesTick()
             actors.noteSay(n)
         elseif n.kind == 'aidone' then
             actors.noteAiDone(n)
-        elseif n.kind == 'crimecombat' then
+        elseif n.kind == 'crimecombat' or n.kind == 'scriptcombat' then
+            -- scriptcombat: a world script's StartCombat Player on a puppet (same claim)
             actors.noteCrimeCombat(n)
+        elseif n.kind == 'crimepursue' then
+            actors.noteCrimeCombat(n, true) -- a guard's arrest chase, same claim
         else
             objects.onScriptNote(n)
         end
@@ -1889,9 +1895,13 @@ local function start()
         -- sees the stand-in for that same person.
         playerIdOf = function(obj)
             if not (obj and obj:isValid()) then return nil end
-            for _, pl in ipairs(world.players) do
-                if pl:isValid() and pl.id == obj.id then
-                    return net.state == 'Joined' and net.playerId or nil
+            -- The sim peer's player is a parked dummy: a fight on it names nobody, never the
+            -- peer's own id (1.7.0). Its avatars are found in puppets below.
+            if not (mp.isSystem and mp.isSystem()) then
+                for _, pl in ipairs(world.players) do
+                    if pl:isValid() and pl.id == obj.id then
+                        return net.state == 'Joined' and net.playerId or nil
+                    end
                 end
             end
             for id, p in pairs(puppets) do
@@ -2398,6 +2408,9 @@ local eventHandlers = {
         if not (mp.isSystem and mp.isSystem()) or not data or not data.id then return end
         local p = puppets[data.id]
         if not p or not p.obj or not p.obj:isValid() then return end
+        -- The owner's fall knocked them down (playerstate.ts hp.kd): so is the avatar.
+        if data.kd == true and mp.setKnockedDown then pcall(mp.setKnockedDown, p.obj) end
+        if not (data.hp or data.mp or data.ft) then return end
         -- Self-gated write (see applyAvatarDoc): the avatar's script applies it. Done from
         -- here it threw inside a pcall, and no potion, rest or self-heal ever reached the
         -- avatar -- the next report undid every one of them (s112).
@@ -2935,8 +2948,9 @@ local eventHandlers = {
 
     -- M2 respawn service: teleport self, then let player.lua revive/refill.
     MP_PlayerResurrect = function(data)
-        teleportPlayerTo(data)
-        toPlayer('MP_DoResurrect', { restoreHp = data.restoreHp == true })
+        -- standUp: a death the peer never confirmed (playerstate.ts) -- up where we lie.
+        if not data.standUp then teleportPlayerTo(data) end
+        toPlayer('MP_DoResurrect', { restoreHp = data.restoreHp == true, standUp = data.standUp == true, hp = data.hp })
     end,
 
     -- Test hook (equip:<id>:<slot>): grant an item into the LOCAL player's inventory.
@@ -3603,6 +3617,12 @@ local eventHandlers = {
     -- (s125 in #90/#91): a detach on a body without the script is a no-op.
     mpPuppetDetached = function(data)
         local obj = data.obj
+        -- RE-ATTACHED IN THE MEANTIME. A creature crossing a cell border is detached, and its new
+        -- cell's first pose can land before this hop: actors.lua records it as puppeted again (the
+        -- addScript is a no-op on a script still attached) and the pose re-arms it. Removing the
+        -- script now left a body running its own AI while counted as a puppet -- slaughterfish and
+        -- cliff racers drawn up to 1,900 u off their path with no snap (prod 2026-10-23).
+        if obj and obj:isValid() and actors.isPuppetedActor(obj) then return end
         if obj and obj:isValid() and obj:hasScript('scripts/mp/puppet.lua') then
             pcall(obj.removeScript, obj, 'scripts/mp/puppet.lua')
         end
