@@ -11,6 +11,8 @@ local world = require('openmw.world')
 local mp = require('openmw.mp')
 
 local json = require('scripts.mp.json')
+-- teleports refused while another is in flight land on a later frame (latest wins)
+local retry = require('scripts.mp.retry')
 
 local actors = {}
 
@@ -37,6 +39,12 @@ local lastMirror = 0
 local lastAttachSweep = 0
 local watchKillRecord = nil -- record whose shared kill tally the scenarios watch
 local batchesIn = 0 -- diagnostic: ActorMoveBatch frames applied as a non-holder
+-- refKey -> { cellKey, frame }: where MP_ActorCellChange sent an actor. obj.cell still names
+-- the OLD cell until the teleport lands (end of frame, later on a retry), so a puppet
+-- re-attached from a pose in that window recorded the cell it left -- and the destination's
+-- detachActorPuppetsInCell never found it (a frozen NPC under its new holder).
+local movedTo = {}
+local frameNo = 0 -- actors.tick count
 
 -- --------------------------------------------------------------- ref helpers
 
@@ -492,7 +500,7 @@ local function attachActorPuppets(cellKey)
                 obj:addScript('scripts/mp/puppet.lua', { actorKey = key })
             end)
             if ok then
-                puppetActors[key] = { obj = obj, cellKey = cellKey }
+                puppetActors[key] = { obj = obj, cellKey = actors.cellKeyFor(key, obj) }
                 -- Died before we got here: the world says so; the body must agree.
                 if pendingDeaths[key] then
                     pendingDeaths[key] = nil
@@ -553,10 +561,8 @@ actors.handlers.MP_ActorAuthorityGrant = function(data)
         local obj = (not a.dead) and actorOf(a) or nil
         if obj then
             local cellArg = obj.cell and not obj.cell.isExterior and obj.cell.name or ''
-            pcall(function()
-                obj:teleport(cellArg, util.vector3(a.x, a.y, a.z),
-                    { rotation = util.transform.rotateZ(a.rotZ or 0) })
-            end)
+            retry.teleport(obj, cellArg, util.vector3(a.x, a.y, a.z), nil,
+                { rotation = util.transform.rotateZ(a.rotZ or 0) })
             -- Self-gated write: the actor's own script (companion.lua mpSetStats) applies it.
             pcall(function() obj:sendEvent('mpSetStats', { hp = a.hp, mp = a.mp, ft = a.ft }) end)
             if type(a.disp) == 'number' then
@@ -631,7 +637,7 @@ actors.handlers.MP_ActorMoveBatch = function(batch)
                 local ok = pcall(function()
                     obj:addScript('scripts/mp/puppet.lua', { actorKey = key })
                 end)
-                if ok then puppetActors[key] = { obj = obj, cellKey = cellKeyOf(obj.cell) } end
+                if ok then puppetActors[key] = { obj = obj, cellKey = actors.cellKeyFor(key, obj) } end
             end
             e.t = now
             e.actorKey = key -- re-arms a puppet detached a moment ago (puppet.lua MP_Pose)
@@ -661,9 +667,8 @@ actors.handlers.MP_ActorCellChange = function(data)
     -- engine looked it up as a name, failed inside the pcall, and the actor never arrived --
     -- so every NPC that walked outdoors kept standing indoors on every other screen.
     local cellArg = data.toCellKey:match('^%-?%d+,%-?%d+$') and '' or data.toCellKey
-    pcall(function()
-        obj:teleport(cellArg, util.vector3(data.x or 0, data.y or 0, data.z or 0))
-    end)
+    movedTo[key] = { cellKey = data.toCellKey, frame = frameNo }
+    retry.teleport(obj, cellArg, util.vector3(data.x or 0, data.y or 0, data.z or 0))
 end
 
 actors.handlers.MP_ActorStatsDynamic = function(data)
@@ -864,15 +869,39 @@ end
 -- reached the Ghostgate for the guest. The engine notes the move (mwmp/puppets.hpp) under the
 -- cell the actor is LEAVING, the one somebody holds; the holder teleports the real one. The
 -- holder itself says nothing: its move is the authoritative one and streams out as a pose.
-function actors.notePosition(obj, cellName, pos)
+-- 1.7.1: a SETTLING move (count 0: SetPos runs, a script's per-frame Move/MoveWorld) is held
+-- per actor and sent once it has not moved for POSITION_SETTLE_S -- the server allows five
+-- position claims a minute, and a script walking an NPC a frame at a time would spend them in
+-- a tenth of a second and then lose the move that mattered: where it stopped. The cell key of
+-- the FIRST held note is kept (the cell somebody holds); position and facing are the latest.
+local POSITION_SETTLE_S = 0.5
+actors.settlingMoves = {} -- obj.id -> { obj, cellName, pos, at }
+function actors.notePosition(obj, cellName, pos, now)
     if not (obj and obj:isValid()) or type(pos) ~= 'table' or type(pos.x) ~= 'number' then return end
+    if pos.count == 0 and now == nil then
+        local held = actors.settlingMoves[obj.id]
+        local first = held and held.pos.cellKey or pos.cellKey
+        actors.settlingMoves[obj.id] = { obj = obj, cellName = cellName,
+            pos = { x = pos.x, y = pos.y, z = pos.z, rotZ = pos.rotZ, cellKey = first }, at = core.getRealTime() }
+        return
+    end
     local cellKey = type(pos.cellKey) == 'string' and pos.cellKey ~= '' and pos.cellKey or actors.cellKeyOfObj(obj)
     if not cellKey or actors.isHolderOf(cellKey) then return end
     local body = withAddr({
         cellKey = cellKey, epoch = actors.epochOf(cellKey) or 0,
-        position = { cell = tostring(cellName or ''), x = pos.x, y = pos.y or 0, z = pos.z or 0 },
+        position = { cell = tostring(cellName or ''), x = pos.x, y = pos.y or 0, z = pos.z or 0,
+            rotZ = type(pos.rotZ) == 'number' and pos.rotZ or nil },
     }, obj)
     if body then mp.sendEvent('ActorAI', body) end
+end
+
+function actors.flushSettlingMoves(now)
+    for id, m in pairs(actors.settlingMoves) do
+        if now - m.at >= POSITION_SETTLE_S then
+            actors.settlingMoves[id] = nil
+            actors.notePosition(m.obj, m.cellName, m.pos, now)
+        end
+    end
 end
 
 -- SCRIPTED SAY (backlog 217). "Say" from a script the peer runs (Dagoth Ur's lines) played to
@@ -978,7 +1007,8 @@ actors.handlers.MP_ActorAI = function(data)
         -- A scripted teleport from a non-holder (notePosition); the server sends it to the
         -- holder only. An empty cell name is the default exterior, resolved from x,y.
         local p = data.position
-        pcall(function() obj:teleport(tostring(p.cell or ''), util.vector3(p.x, p.y or 0, p.z or 0)) end)
+        local opts = type(p.rotZ) == 'number' and { rotation = util.transform.rotateZ(p.rotZ) } or nil
+        retry.teleport(obj, tostring(p.cell or ''), util.vector3(p.x, p.y or 0, p.z or 0), nil, opts)
         return
     end
     if data.done == true then
@@ -994,15 +1024,17 @@ actors.handlers.MP_ActorAI = function(data)
             -- so it kept its back to whoever spoke to it. Turned once, in place, toward their body.
             local body = data.hold == true and data.by ~= nil and deps.playerObjOf and deps.playerObjOf(data.by) or nil
             if body and body:isValid() then
-                pcall(function()
+                local okT, cellArg, pos, yaw = pcall(function()
                     local d = body.position - obj.position
                     local len = math.sqrt(d.x * d.x + d.y * d.y)
-                    if len < 1 then return end
+                    if len < 1 then return nil end
                     -- yaw from +Y toward +X; acos, not atan2: the peer is LuaJIT, the browser 5.4
                     local yaw = math.acos(math.max(-1, math.min(1, d.y / len))) * (d.x < 0 and -1 or 1)
-                    local cellArg = obj.cell and not obj.cell.isExterior and obj.cell.name or ''
-                    obj:teleport(cellArg, obj.position, { rotation = util.transform.rotateZ(yaw), onGround = true })
+                    return obj.cell and not obj.cell.isExterior and obj.cell.name or '', obj.position, yaw
                 end)
+                if okT and cellArg then
+                    retry.teleport(obj, cellArg, pos, nil, { rotation = util.transform.rotateZ(yaw), onGround = true })
+                end
             end
             pcall(function() obj:sendEvent('MP_DialogueHold', { on = data.hold == true }) end)
         end
@@ -1224,7 +1256,7 @@ function actors.snapActor(actorKey, pos)
         -- WITH ITS FACING. A snap that kept the old yaw left the body inside the 64 u gate,
         -- walking the new way while turned round (1% of walking NPCs on prod, 2026-10-23).
         local opts = type(pos.yaw) == 'number' and { rotation = util.transform.rotateZ(pos.yaw) } or nil
-        pcall(function() obj:teleport(cellArg, util.vector3(pos.x, pos.y, pos.z), opts) end)
+        retry.teleport(obj, cellArg, util.vector3(pos.x, pos.y, pos.z), nil, opts)
     end
 end
 
@@ -1288,7 +1320,18 @@ end
 
 -- --------------------------------------------------------------- tick
 
+-- The cell an actor's puppet belongs to: where MP_ActorCellChange sent it while that move is
+-- this frame's or the last, or still queued in retry.lua; otherwise where it stands.
+function actors.cellKeyFor(key, obj)
+    local m = movedTo[key]
+    if m and (frameNo - m.frame <= 1 or retry.pendingTeleport(obj)) then return m.cellKey end
+    movedTo[key] = nil
+    return cellKeyOf(obj.cell)
+end
+
 function actors.tick(now)
+    actors.flushSettlingMoves(now)
+    frameNo = frameNo + 1
     -- Non-holder: keep trying to puppet our cell's actors. Attaching ONLY on
     -- MP_ActorAuthorityInfo loses the race — that event lands on our PlayerCellChange,
     -- while the cell's actors are still streaming in, so cellActors() is empty or partial

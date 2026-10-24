@@ -829,7 +829,9 @@ export class WorldState {
         const pt = p instanceof Map ? p as LTable : undefined;
         const x = pt ? finite(pt.get('x')) : undefined, y = pt ? finite(pt.get('y')) : undefined, z = pt ? finite(pt.get('z')) : undefined;
         const cell = pt?.get('cell');
+        const rotZ = pt?.get('rotZ'); // 1.7.1: SetAngle/SetAtStart facing, radians
         if (!cellKey || !ref || x === undefined || y === undefined || z === undefined
+          || (rotZ !== undefined && (finite(rotZ) === undefined || Math.abs(rotZ as number) > 64))
           || Math.abs(x) > MAX_ABS_COORD || Math.abs(y) > MAX_ABS_COORD || Math.abs(z) > MAX_ABS_COORD
           || (cell !== undefined && (typeof cell !== 'string' || cell.length > MAX_CELL_KEY))) {
           this.invalid(player, name);
@@ -1428,6 +1430,7 @@ export class WorldState {
     delete doc.doors[ref.key];
     delete doc.containers[ref.key];
     this.cells.markDirty(cellKey);
+    if (!player.system) player.questTriggerAt = Date.now(); // a pickup runs OnPCAdd (quests.ts guestWriteUnbacked)
     reply(true);
     this.relayCell(cellKey, 'ObjectDelete', { ...objRefToJs(ref), cellKey, byId: player.id });
   }
@@ -1537,7 +1540,7 @@ export class WorldState {
       return;
     }
     if (cellMapFull(doc.doors, ref.key, cellKey, 'doors', player.name)) return;
-    if (!player.system) player.lastDoorAt = Date.now(); // #361: a door used is a teleport explained
+    if (!player.system) player.lastDoorAt = player.questTriggerAt = Date.now(); // #361: a door used is a teleport explained
     doc.doors[ref.key] = open;
     this.cells.markDirty(cellKey);
     this.relayCell(cellKey, 'DoorState', { ...objRefToJs(ref), cellKey, open, byId: player.id });
@@ -1705,6 +1708,7 @@ export class WorldState {
         reply(false, 'gone', cont.stateSeq); // losing racer / stale client view
         return;
       }
+      if (!player.system) player.questTriggerAt = Date.now(); // OnPCAdd (quests.ts guestWriteUnbacked)
       // Phase 4: quest-critical items NEVER deplete. Morrowind puts exactly one Dwemer
       // Puzzle Box in Arkngthand; with per-character journals the second player still
       // needs to find one, and TES3MP's answer (it is simply gone) is the single most

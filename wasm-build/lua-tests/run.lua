@@ -535,7 +535,7 @@ do
     ob:find("mp.sendEvent%('ObjectSpawnRequest', {%s*tempId = 0, actor = true") ~= nil)
   check('WorldCellState applies persisted re-enables', ob:find('for _, refKey in ipairs(data.enabled or {}) do', 1, true) ~= nil)
   check('actors.notePosition rides ActorAI and the holder teleports on it',
-    ac:find('position = { cell = tostring(cellName or ', 1, true) ~= nil and ac:find("obj:teleport(tostring(p.cell or ''), util.vector3(p.x", 1, true) ~= nil)
+    ac:find('position = { cell = tostring(cellName or ', 1, true) ~= nil and ac:find("retry.teleport(obj, tostring(p.cell or ''), util.vector3(p.x", 1, true) ~= nil)
   check('mpQuestSpawn places a forwarded PlaceAtPC at its spot',
     g:find("if type(data.x) == 'number' then", 1, true) ~= nil and g:find('world.getCellByName(key)', 1, true) ~= nil)
   -- EVERY SCRIPT MUST PARSE. A script with a syntax error is silently not attached by the
@@ -1080,7 +1080,7 @@ do
     and q:find('if lockPending and lockPending.id == obj.id then return end', 1, true) ~= nil)
   check('a forced grant sets lockHeld/lockDisposition like the activation path and does not re-activate',
     q:find('lockAllowOnce = not forced and obj.id or nil', 1, true) ~= nil
-    and q:find('if player and not forced then obj:activateBy(player) end', 1, true) ~= nil)
+    and q:find('if player and not forced then\n            lockGrantedAt = core.getRealTime()\n            obj:activateBy(player)', 1, true) ~= nil)
   check('a forced denial closes the window the other holder owns',
     q:find("if forced then%s+local player = playerObj%(%)%s+if player then pcall%(function%(%) player:sendEvent%('MP_CloseDialogue', {}%) end%) end") ~= nil)
   check('actors.lua hands every MP_ActorDeath to the quest layer',
@@ -1095,7 +1095,7 @@ do
     pl:find("MP_CloseDialogue = function()", 1, true) ~= nil and pl:find("I.UI.removeMode('Dialogue')", 1, true) ~= nil)
   check('the lock grant arms an open-ended member-var watch and the release flushes it',
     q:find('until_ = math.huge', 1, true) ~= nil and q:find('armLockWatch(obj)', 1, true) ~= nil
-    and q:find('if obj:isValid() then pcall(flushMemberVars, watch) end', 1, true) ~= nil)
+    and q:find('local okf, errf = pcall(flushMemberVars, watch)', 1, true) ~= nil)
   check('the re-run activation does not shorten the conversation watch back to 6 s',
     q:find('if lockHeld and lockHeld.id == object.id and memberWatch[object.id] then return end', 1, true) ~= nil)
 end
@@ -1445,7 +1445,7 @@ do
       and q:find('mp.addJournalEntryAt(questId, index, stamp.d, stamp.m, stamp.dm)', 1, true) ~= nil
       and q:find('quest:addJournalEntry(index)', 1, true) ~= nil)
   check('a pre-player entry keeps its stamp and order through the retry',
-    q:find('for _, e in ipairs(retry) do applyJournalEntry(e.q, e.i, e.stamp) end', 1, true) ~= nil)
+    q:find('for _, e in ipairs(retry) do applyJournalEntry(e.q, e.i, e.stamp, e.regress) end', 1, true) ~= nil)
   -- 259: only a named exterior becomes a visited location.
   local h = w:match('handlers%.MP_WorldMapExplored = function%(data%)(.-)\nend')
   check('MP_WorldMapExplored skips unnamed cells', h ~= nil
@@ -1596,8 +1596,8 @@ do
   local pp = io.open('./openmw/files/data/scripts/mp/puppet.lua'):read('*a')
   -- 335: the echo guard is a per-quest SET of applied stages, not one slot.
   check('quests.lua keeps a per-quest set of applied stages and drops their echoes (335)',
-    q:find('applied[questId][index] = true', 1, true) ~= nil
-    and q:find('if applied[questId] and applied[questId][stage] then return end', 1, true) ~= nil
+    q:find('applied[questId][index] = core.getRealTime()', 1, true) ~= nil
+    and q:find('if at and core.getRealTime() - at <= APPLIED_ECHO_S then return end', 1, true) ~= nil
     and q:find('\n    applied = {}\n', 1, true) ~= nil)
   -- 336: a refused declaration is forgotten at most 3 times per kind while it stands still.
   check('identity.lua caps forgetDeclared at 3 per kind until the fingerprint changes (336)',
@@ -1650,8 +1650,8 @@ do
     and ob:find('containerOpenPending[obj.id] = { obj = obj, at = core.getRealTime() }', 1, true) ~= nil)
   -- #294: the retry carries the followers.
   check('tryTeleport takes onLanded and the retry tick fires it',
-    g:find('local function tryTeleport(obj, cellArg, pos, onLanded)', 1, true) ~= nil
-    and g:find('if t.onLanded then pcall(t.onLanded) end', 1, true) ~= nil
+    g:find('local tryTeleport = retry.teleport', 1, true) ~= nil
+    and io.open('./openmw/files/data/scripts/mp/retry.lua'):read('*a'):find('function retry.teleport(obj, cellArg, pos, onLanded, opts)', 1, true) ~= nil
     and g:find('tryTeleport(p.obj, dest, util.vector3(data.x, data.y, data.z), carryFollowers)', 1, true) ~= nil)
   -- #293: the revive edge and its applier.
   check('the holder sends ActorRevive on the revive edge and clients apply it with mp.resurrect(obj)',
@@ -1846,9 +1846,10 @@ do
   check('the peer arms open-ended member watches over held cells, with the cell key on the wire',
     g:find('heldCellsFn = function() return actors.heldCells() end, -- #217', 1, true) ~= nil
     and q:find('local function armHeldWatches(now)', 1, true) ~= nil
-    and q:find('poll = HELD_WATCH_POLL, until_ = math.huge,', 1, true) ~= nil
-    and q:find('value = value, cellKey = watch.cellKey }', 1, true) ~= nil
-    and qs:find("(player.system === true && str(body.get('cellKey'))) || player.cellKey", 1, true) ~= nil)
+    and q:find('armCellWatches(cell, now, HELD_WATCH_POLL)', 1, true) ~= nil
+    and q:find('poll = poll, until_ = math.huge, dialogue = dialogue,', 1, true) ~= nil
+    and q:find('cellKey = (okk and key) or watch.cellKey }', 1, true) ~= nil
+    and qs:find("const cellKey = named ?? player.cellKey;", 1, true) ~= nil)
   check('OpSay on the peer becomes ActorSay and puppets core.sound.say the line',
     snd:find('MWMP::recordScriptNote({ "say"', 1, true) ~= nil
     and g:find("elseif n.kind == 'say' then", 1, true) ~= nil
@@ -2314,7 +2315,7 @@ do
   local gl = io.open('./openmw/files/data/scripts/mp/global.lua'):read('*a')
   check('global.lua counts a puppet death in MP_PlayerStatsDynamic and mirrors puppetDeaths',
     gl:find("puppetDeaths[key] = (puppetDeaths[key] or 0) + 1", 1, true) ~= nil
-    and gl:find("local key = tostring(data.id)", 1, true) ~= nil
+    and gl:find("local key = kit.idKey(data.id)", 1, true) ~= nil
     and gl:find("mp.set('puppetDeaths', json.encode(puppetDeaths))", 1, true) ~= nil)
 end
 
@@ -2508,9 +2509,8 @@ do
   check('global.lua mpSnapRequest ignores a snap from a body it does not track',
     g:find('if p and data.obj ~= nil and p.obj ~= data.obj then return end', 1, true) ~= nil)
   check('despawnPuppet retries a remove() refused mid-teleport instead of forgetting the body',
-    g:find('if p.obj:isValid() and not pcall(function() p.obj:remove() end) then', 1, true) ~= nil
-    and g:find('removeRetry[p.obj] = core.getRealTime() + 1', 1, true) ~= nil
-    and g:find('removeRetryTick(now) -- a despawn refused mid-teleport lands now (480)', 1, true) ~= nil)
+    g:find('    retry.remove(p.obj)\n', 1, true) ~= nil
+    and g:find('retry.tick(now) -- a teleport that threw last frame lands now; a refused remove too (480)', 1, true) ~= nil)
   check('spawnPuppet skips a pose outside the loaded neighbourhood (a lagging avatar two cells back)',
     g:find('if not poseInView(pose) then return end', 1, true) ~= nil
     and g:find("visibleFrom(ownCellKeyCache, math.floor(pose.x / 8192) .. ',' .. math.floor(pose.y / 8192))", 1, true) ~= nil)
@@ -2525,10 +2525,9 @@ do
   local g = io.open('./openmw/files/data/scripts/mp/global.lua'):read('*a')
   local idn = io.open('./openmw/files/data/scripts/mp/identity.lua'):read('*a')
   check('a refused remove() disables the body at once (no solid ghost while the retry waits)',
-    g:find('pcall(function() p.obj.enabled = false end)', 1, true) ~= nil)
+    io.open('./openmw/files/data/scripts/mp/retry.lua'):read('*a'):find('pcall(function() obj.enabled = false end)', 1, true) ~= nil)
   check('the remove retry has no deadline, on a once-a-second cadence',
-    g:find('if pcall(function() obj:remove() end) then removeRetry[obj] = nil else removeRetry[obj] = now + 1 end', 1, true) ~= nil
-    and g:find('now > until_', 1, true) == nil)
+    io.open('./openmw/files/data/scripts/mp/retry.lua'):read('*a'):find('if pcall(function() r.obj:remove() end) then removes[id] = nil else r.at = now + 1 end', 1, true) ~= nil)
   check('despawnPuppet takes the body out of the avatar registry',
     g:find('if mp.setAvatar then pcall(mp.setAvatar, p.obj, false) end', 1, true) ~= nil)
   check('the owner re-sends its active effects when its look (the peer rebuild keys) changes',
@@ -4555,5 +4554,434 @@ do
     re.buf[#re.buf].t > re.buf[#re.buf - 1].t)
 end
 
+-- ============================================================ 1.7.1 quests.lua: journal never walks backwards
+-- A relayed entry set quest.stage unconditionally, so a lagging engine's entry (or a log line
+-- replayed under a later stage) moved a quest back. Only an authorised regression may.
+print('1.7.1 quests.lua -- a network journal entry raises the stage; only a flagged regression lowers it')
+local function questEnv()
+  fresh()
+  package.loaded['scripts.mp.quests'] = nil
+  local e = stubs.install({})
+  e.core.factions = { records = {} } -- quests.tick diffs these with a player present
+  e.types.Player.getCrimeLevel = function() return 0 end
+  local stages = {}
+  e.types.Player.quests = function()
+    return setmetatable({}, { __index = function(_, id)
+      return setmetatable({}, {
+        __index = function(_, k)
+          if k == 'stage' then return stages[id] or 0 end
+          if k == 'addJournalEntry' then return function(_, i) stages[id] = i end end
+        end,
+        __newindex = function(_, k, v) if k == 'stage' then stages[id] = v end end,
+      })
+    end })
+  end
+  local q = require('scripts.mp.quests')
+  local player = { id = 'player' }
+  q.init({ playerFn = function() return player end, ownCellKeyFn = function() return '0,0' end })
+  return e, q, stages
+end
+do
+  local e, q, stages = questEnv()
+  q.handlers.MP_JournalEntry({ questId = 'mq', index = 40 })
+  check('an entry raises the stage', stages.mq == 40)
+  q.handlers.MP_JournalEntry({ questId = 'mq', index = 20 })
+  check('a lower unflagged entry does not move the quest back', stages.mq == 40, tostring(stages.mq))
+  q.handlers.MP_JournalEntry({ questId = 'mq', index = 10, regress = true })
+  check('a flagged regression (a restart) lands', stages.mq == 10, tostring(stages.mq))
+  q.handlers.MP_JournalSync({ quests = { mr = 10 }, journalLog = {
+    { q = 'mr', i = 10, d = 1, m = 1, dm = 1 }, { q = 'mr', i = 20, d = 2, m = 1, dm = 2 }, { q = 'mr', i = 30, d = 3, m = 1, dm = 3 },
+  } })
+  check("JournalSync's map is the current stage over a log holding a restarted quest's later stages", stages.mr == 10, tostring(stages.mr))
+  local sent = 0
+  for _, c in ipairs(e.calls.events) do if c.name == 'JournalEntry' then sent = sent + 1 end end
+  check('applying the network never echoes a JournalEntry back', sent == 0, sent .. ' sent')
+end
+
+print('1.7.1 quests.lua -- a replayed stage is an echo for a moment, not for the session; a local restart is sent')
+do
+  local e, q = questEnv()
+  q.handlers.MP_JournalSync({ quests = { mq = 40 }, journalLog = {
+    { q = 'mq', i = 20, d = 1, m = 1, dm = 1 }, { q = 'mq', i = 40, d = 2, m = 1, dm = 2 } } })
+  local function sentStages()
+    local out = {}
+    for _, c in ipairs(e.calls.events) do if c.name == 'JournalEntry' then out[#out + 1] = c.body.index end end
+    return out
+  end
+  q.onQuestUpdate('mq', 20) -- the engine's echo of the replayed log line, a frame later
+  check('the echo of a replayed stage is swallowed', #sentStages() == 0)
+  e.advance(60)
+  q.onQuestUpdate('mq', 20) -- the player restarts the quest to a stage the log replayed
+  local s = sentStages()
+  check('a restart to a replayed stage, later in the session, is sent', #s == 1 and s[1] == 20, table.concat(s, ','))
+  q.handlers.MP_JournalEntry({ questId = 'mq', index = 5, regress = true })
+  q.onQuestUpdate('mq', 5)
+  check('the echo of an applied regression is still swallowed', #sentStages() == 1)
+end
+
+do
+  local e, q, stages = questEnv()
+  q.handlers.MP_JournalSync({ quests = { mq = 10 }, journalLog = {
+    { q = 'mq', i = 10, d = 1, m = 1, dm = 1 }, { q = 'mq', i = 20, d = 2, m = 1, dm = 2 }, { q = 'mq', i = 30, d = 3, m = 1, dm = 3 } } })
+  for _, st in ipairs({ 10, 20, 30, 10 }) do q.onQuestUpdate('mq', st) end -- the engine's echoes, a frame later
+  local n = 0
+  for _, c in ipairs(e.calls.events) do if c.name == 'JournalEntry' then n = n + 1 end end
+  check("a restarted quest's sync lands at the map stage and none of its log echoes travel", stages.mq == 10 and n == 0,
+    'stage ' .. tostring(stages.mq) .. ', ' .. n .. ' sent')
+end
+
+print('1.7.1 quests.lua -- an AddTopic unlock (the engine known-topic set) is diffed and sent; an applied topic goes through addTopic')
+do
+  local e, q = questEnv()
+  local known = { 'Background' }
+  e.mp.knownTopics = function() return known end
+  local added = {}
+  e.types.Player.addTopic = function(_, id)
+    if id == 'no such topic' then error('topic record not found') end
+    added[#added + 1] = id
+  end
+  q.tick(0) -- baseline
+  known = { 'Background', 'Dwemer Puzzle Box' } -- a dialogue result's AddTopic
+  q.tick(1)
+  local sent
+  for _, c in ipairs(e.calls.events) do if c.name == 'TopicsLearned' then sent = c.body.topics end end
+  check('a topic only AddTopic unlocked is sent', sent ~= nil and #sent == 1 and sent[1] == 'dwemer puzzle box',
+    sent and table.concat(sent, ',') or 'nothing sent')
+  q.handlers.MP_TopicsLearned({ topics = { 'Ald-ruhn', 'no such topic' } })
+  check('a synced topic is applied through the engine addTopic', #added == 1 and added[1] == 'Ald-ruhn')
+  local said = false
+  for _, p in ipairs(e.calls.prints) do if p:find('addTopic "no such topic" failed', 1, true) then said = true end end
+  check('a failed addTopic is printed', said)
+  e.types.Player.addTopic = function(_, id) added[#added + 1] = id end
+  q.handlers.MP_TopicsLearned({ topics = { 'no such topic' } })
+  check('a failed topic is not marked applied, so the next sync retries it', added[#added] == 'no such topic')
+end
+
+print('1.7.1 quests.lua -- a world global after a relog outbids the stored seq')
+do
+  local e, q = questEnv()
+  e.setGlobal('weather', 0)
+  q.tick(0) -- baseline
+  q.handlers.MP_GlobalVarSync({ globals = { weather = 3 }, seqs = { weather = 41 } })
+  e.setGlobal('weather', 4)
+  q.tick(1)
+  local seq
+  for _, c in ipairs(e.calls.events) do if c.name == 'GlobalVarUpdate' and c.body.name == 'weather' then seq = c.body.seq end end
+  check("the client's next write is stamped above the server's stored seq", seq == 42, tostring(seq))
+end
+
+print("1.7.1 quests.lua -- a conversation watches its cell's scripted objects; a member var names the object's cell")
+do
+  local e, q = questEnv()
+  local cell
+  local function obj(id) return { id = id, recordId = id, contentFile = 'morrowind.esm', isValid = function() return true end,
+    activateBy = function() end, cell = nil } end
+  local npc, lever = obj('npc'), obj('lever')
+  cell = { isExterior = true, gridX = 0, gridY = 1, getAll = function() return { npc, lever } end }
+  npc.cell, lever.cell = cell, cell
+  local scripts = { npc = { variables = { talked = 0 } }, lever = { variables = { state = 0 } } }
+  e.world.mwscript.getLocalScript = function(o) return scripts[o.id] end
+  q.onNpcActivate(npc, { id = 'player' })
+  q.handlers.MP_DialogueLockResult({ ref = npc, granted = true })
+  scripts.lever.variables.state = 1 -- the dialogue result: "lever"->Set state to 1
+  e.advance(2)
+  q.tick(2)
+  local upd
+  for _, c in ipairs(e.calls.events) do if c.name == 'MemberVarUpdate' and c.body.name == 'state' then upd = c.body end end
+  check("a dialogue result's write to another object in the cell travels", upd ~= nil and upd.value == 1)
+  check("the update names the object's own cell", upd ~= nil and upd.cellKey == '0,1', upd and tostring(upd.cellKey))
+end
+
+print('1.7.1 quests.lua -- a granted lock whose window never opens is released after about a second')
+do
+  local function run(opens)
+    local e, q = questEnv()
+    local npc = { id = 'npc', recordId = 'npc', contentFile = 'morrowind.esm', isValid = function() return true end, activateBy = function() end }
+    q.onNpcActivate(npc, { id = 'player' })
+    q.handlers.MP_DialogueLockResult({ ref = npc, granted = true })
+    if opens then q.onLockWindowOpened(npc) end
+    e.advance(0.5); q.tick(e.now())
+    e.advance(1.0); q.tick(e.now())
+    for _, c in ipairs(e.calls.events) do if c.name == 'DialogueLock' and c.body.want == false then return true end end
+    return false
+  end
+  check('no window within ~1 s: the lock is released', run(false) == true)
+  check('the window opened: the lock is kept', run(true) == false)
+end
+
+print('1.7.1 actors.lua -- a per-frame scripted move reaches the holder once, where the actor settles, with its facing')
+do
+  fresh()
+  package.loaded['scripts.mp.actors'] = nil
+  local env = stubs.install({})
+  package.loaded['scripts.mp.quests'] = { isTalkingTo = function() return false end }
+  local actors = require('scripts.mp.actors')
+  actors.init({ ownIdFn = function() return 7 end, netIdOf = function() return 42 end })
+  local npc = { id = 'npc', isValid = function() return true end, cell = { isExterior = true, gridX = 0, gridY = 0 } }
+  local function claims()
+    local out = {}
+    for _, c in ipairs(env.calls.events) do if c.name == 'ActorAI' and c.body.position then out[#out + 1] = c.body end end
+    return out
+  end
+  for i = 1, 60 do -- a script's Move, one frame at a time
+    actors.notePosition(npc, '', { count = 0, x = i, y = 0, z = 0, rotZ = 1.5, cellKey = '0,0' })
+    env.advance(1 / 60)
+    actors.flushSettlingMoves(env.now())
+  end
+  check('no claim while the actor is still being moved', #claims() == 0, #claims() .. ' sent')
+  env.advance(0.6)
+  actors.flushSettlingMoves(env.now())
+  local c = claims()
+  check('one claim once it settles, at the final position and facing', #c == 1 and c[1].position.x == 60 and c[1].position.rotZ == 1.5,
+    #c .. ' sent')
+  actors.notePosition(npc, '', { count = 1, x = 5, y = 0, z = 0, cellKey = '0,0' })
+  check('a one-shot move (PositionCell) is still sent at once', #claims() == 2)
+end
+
+print('1.7.1 retry.lua: a teleport or remove refused mid-teleport is retried, never lost')
+do
+  package.loaded['scripts.mp.retry'] = nil
+  local retry = require('scripts.mp.retry')
+  -- An engine-shaped object whose remove/teleport throw `fails` times, like a body whose
+  -- teleport has not landed yet (count 0 until the end of the frame).
+  local function body(id, removeFails, teleportFails)
+    local o = { id = id, recordId = 'rec_' .. id, enabled = true, valid = true, at = nil, moves = 0 }
+    function o:isValid() return self.valid end
+    function o:remove()
+      if removeFails > 0 then removeFails = removeFails - 1; error("Can't remove 0 of 0 items") end
+      self.valid = false
+    end
+    function o:teleport(cell, pos, opts)
+      if teleportFails > 0 then teleportFails = teleportFails - 1; error('already in the process of teleporting') end
+      self.at = { cell = cell, pos = pos, opts = opts }; self.moves = self.moves + 1
+    end
+    return o
+  end
+  local said = {}
+  local rawPrint = print
+  print = function(s) said[#said + 1] = s end
+  local a = body('a', 1, 0)
+  local removedNow = retry.remove(a)
+  print = rawPrint
+  check('a refused remove reports false and disables the object at once', removedNow == false and a.enabled == false and a.valid)
+  retry.tick(10)
+  check('the next tick removes it', a.valid == false)
+  check('the refusal is said once', #said == 1 and said[1]:find('remove refused for a', 1, true) ~= nil, said[1])
+
+  local b = body('b', 0, 2)
+  local landed = 0
+  print = function(s) said[#said + 1] = s end
+  local first = retry.teleport(b, 'Balmora', 1, function() landed = landed + 1 end)
+  local second = retry.teleport(b, '', 2, function() landed = landed + 1 end, { rotation = 'r' })
+  print = rawPrint
+  check('two teleports refused in one frame both report false', first == false and second == false)
+  check('the second refusal on the same object is not said again', #said == 2)
+  check('pendingTeleport names the target it is going to', retry.pendingTeleport(b) and retry.pendingTeleport(b).pos == 2)
+  retry.tick(20)
+  check('the next tick lands the LATEST request, with its options', b.at and b.at.cell == '' and b.at.pos == 2 and b.at.opts.rotation == 'r' and b.moves == 1)
+  check('its onLanded runs once', landed == 1)
+  check('nothing is pending once it landed', retry.pendingTeleport(b) == nil)
+  retry.tick(21)
+  check('a landed teleport is not repeated', b.moves == 1)
+
+  local c = body('c', 0, 0)
+  check('a teleport the engine takes lands now', retry.teleport(c, '', 5) == true and c.moves == 1)
+
+  local d = body('d', 0, 99)
+  retry.teleport(d, '', 1)
+  retry.tick(100)
+  retry.tick(131)
+  check('a teleport that never lands is dropped after 30 s', retry.pendingTeleport(d) == nil)
+
+  local e = body('e', 1, 1)
+  retry.teleport(e, '', 1)
+  retry.remove(e)
+  retry.tick(200)
+  check('a remove cancels the queued teleport', e.valid == false and e.moves == 0)
+  check('a teleport on an object waiting to be removed is refused', (function()
+    local f = body('f', 5, 0)
+    retry.remove(f)
+    return retry.teleport(f, '', 1) == false and f.moves == 0
+  end)())
+
+  -- A follower queued by an onLanded during the tick is not lost to the table walk.
+  local g, h = body('g', 0, 1), body('h', 0, 1)
+  retry.teleport(g, '', 1, function() retry.teleport(h, '', 9) end)
+  retry.tick(300)
+  retry.tick(301)
+  check('a teleport queued from onLanded lands on a later tick', g.moves == 1 and h.moves == 1 and h.at.pos == 9)
+
+  local ob = io.open('./openmw/files/data/scripts/mp/objects.lua'):read('*a')
+  local _, bare = ob:gsub('pcall%(function%(%) obj:remove%(%) end%)', '')
+  check('objects.lua deletes, purges and resets go through retry.remove', select(2, ob:gsub('retry%.remove%(obj%)', '')) >= 4)
+  check('objects.lua bare removes are only on objects it just created', bare == 2, tostring(bare))
+end
+
+
+print('1.7.1 actor and object moves go through retry.teleport: a refusal mid-teleport lands next frame')
+do
+  local ac = io.open('./openmw/files/data/scripts/mp/actors.lua'):read('*a')
+  local ob = io.open('./openmw/files/data/scripts/mp/objects.lua'):read('*a')
+  check('actors.lua has no bare teleport left (cell change, scripted position, snap, handoff, facing)',
+    ac:find('obj:teleport(', 1, true) == nil and select(2, ac:gsub('retry%.teleport%(obj, ', '')) == 5)
+  check('MP_ActorCellChange retries its teleport',
+    ac:find("retry.teleport(obj, cellArg, util.vector3(data.x or 0, data.y or 0, data.z or 0))", 1, true) ~= nil)
+  check('the speaker-facing turn keeps rotation and onGround through the retry',
+    ac:find('retry.teleport(obj, cellArg, pos, nil, { rotation = util.transform.rotateZ(yaw), onGround = true })', 1, true) ~= nil)
+  check('ObjectMove and the cell state moved list retry their teleports',
+    ob:find('retry.teleport(obj, cellArgFor(data.cellKey), util.vector3(data.x, data.y, data.z), nil,', 1, true) ~= nil
+    and ob:find('retry.teleport(obj, cellArgFor(data.cellKey), util.vector3(m.x, m.y, m.z), nil,', 1, true) ~= nil)
+end
+
+print('1.7.1 a puppet re-attached while its cell change is in flight records the cell it is going to')
+do
+  fresh()
+  package.loaded['scripts.mp.actors'] = nil
+  package.loaded['scripts.mp.retry'] = nil
+  local env = stubs.install({})
+  env.types.Player.objectIsInstance = env.types.Player.objectIsInstance or function() return false end
+  package.loaded['scripts.mp.quests'] = { isTalkingTo = function() return false end }
+  local actors = require('scripts.mp.actors')
+  actors.init({ ownIdFn = function() return 7 end, netIdOf = function() return 42 end, playerIdOf = function() return nil end })
+  local events = {}
+  -- Still standing in the shop: the teleport lands at the end of the frame.
+  local npc = { id = 'npc1', recordId = 'fargoth', cell = { isExterior = false, name = 'Seyda Neen, Arrille\'s Tradehouse' } }
+  function npc:isValid() return true end
+  function npc:teleport() end
+  function npc:addScript() end
+  function npc:sendEvent(name) events[#events + 1] = name end
+  actors.handlers.MP_ActorCellChange({ ref = npc, toCellKey = '-2,-9', x = 1, y = 2, z = 3 })
+  actors.handlers.MP_ActorMoveBatch({ { ref = npc, x = 1, y = 2, z = 3, yaw = 0, pitch = 0, flags = 0 } })
+  events = {}
+  actors.handlers.MP_ActorAuthorityGrant({ cellKey = '-2,-9', epoch = 1 })
+  local detached = false
+  for _, e in ipairs(events) do if e == 'MP_Detach' then detached = true end end
+  check('the destination cell\'s grant finds and detaches it', detached, table.concat(events, ','))
+  -- Two frames on, with nothing queued, the actor's own cell rules again.
+  pcall(actors.tick, 1); pcall(actors.tick, 2) -- the frame count is its first line; the stubs stop the rest
+  local okK, key = pcall(actors.cellKeyFor, 'o:npc1', npc)
+  check('two frames later obj.cell rules again', okK and key == "seyda neen, arrille's tradehouse", tostring(key))
+  package.loaded['scripts.mp.quests'] = nil
+  package.loaded['scripts.mp.actors'] = nil
+end
+
+print('1.7.1 rebuildPuppet respawns at the queued teleport or the last pose, not the lagging body')
+do
+  local g = io.open('./openmw/files/data/scripts/mp/global.lua'):read('*a')
+  local a = g:find('local function rebuildPuppet(id)', 1, true)
+  local q = a and g:find('local queued = retry.pendingTeleport(p.obj)', a, true)
+  local pick = a and g:find('local pos = (queued and queued.pos) or lastPose[id] or p.obj.position', a, true)
+  local d = a and g:find('despawnPuppet(id)', a, true)
+  check('the target is read before the despawn drops the queued move', q and pick and d and q < pick and pick < d)
+end
+
+print('1.7.1 a numeric id keys the same on Lua 5.4 and LuaJIT ("p:2", never "p:2.0")')
+do
+  local g = io.open('./openmw/files/data/scripts/mp/global.lua'):read('*a')
+  local body = g:match('(function kit%.idKey%(id%).-\nend)')
+  local kit = {}
+  local okL = body and pcall(assert((loadstring or load)('local kit = ...\n' .. body)), kit)
+  check('kit.idKey loads on its own', okL and type(kit.idKey) == 'function')
+  if okL then
+    check('a double id keys as an integer', kit.idKey(2.0) == '2' and kit.idKey(2) == '2' and kit.idKey(123456789.0) == '123456789')
+    check('a string id is left alone', kit.idKey('abc') == 'abc')
+  end
+  check('no player-id key in global.lua is built with tostring',
+    g:find("'p:' .. tostring(", 1, true) == nil and g:find('m[tostring(id)]', 1, true) == nil
+    and select(2, g:gsub("'p:' %.%. kit%.idKey%(id%)", '')) == 2)
+  check('puppetDeaths keys by kit.idKey', g:find('local key = kit.idKey(data.id) -- json.encode wants string keys', 1, true) ~= nil)
+  local ob = io.open('./openmw/files/data/scripts/mp/objects.lua'):read('*a')
+  check('the netObjects mirrors key net ids with %.0f',
+    ob:find("netObjs[string.format('%.0f', netId)]", 1, true) ~= nil and ob:find("netNames[string.format('%.0f', netId)]", 1, true) ~= nil)
+end
+
+print('1.7.1 GetLOS and GetDetected "Player" on the sim peer ask about the nearest avatar, not the dummy')
+do
+  local au = io.open('./openmw/apps/openmw/mwmechanics/actorutil.cpp'):read('*a')
+  local ai = io.open('./openmw/apps/openmw/mwscript/aiextensions.cpp'):read('*a')
+  local a = au:find('MWWorld::Ptr nearestAvatarTo(const MWWorld::Ptr& ptr)', 1, true)
+  check('nearestAvatarTo is peer-only (singleplayer and clients get an empty Ptr)',
+    a and au:find('static const bool simPeer = std::getenv("OPENMW_MP_SYSTEM") != nullptr;', a, true)
+    and au:find('if (!simPeer || ptr.isEmpty() || ptr.getCell() == nullptr)\n            return MWWorld::Ptr();', a, true))
+  check('...and only takes an avatar in the same room or outdoors with it',
+    a and au:find('!MWMP::isAvatar(body.getCellRef().getRefNum())', a, true)
+    and au:find('(there != here && !(there->isExterior() && here->isExterior()))', a, true))
+  check('GetDetected and GetLOS resolve through it, falling back to searchPtr',
+    ai:find('MWWorld::Ptr actor = searchActorOrAvatar(actorID, observer);', 1, true) ~= nil
+    and ai:find('MWWorld::Ptr dest = searchActorOrAvatar(actorID, source);', 1, true) ~= nil
+    and ai:find('return MWBase::Environment::get().getWorld()->searchPtr(id, true, false);', 1, true) ~= nil
+    and select(2, ai:gsub('searchPtr%(actorID, true, false%)', '')) == 0)
+end
+print('1.7.1 GetDistance "Player" on the sim peer measures to the nearest avatar, falling back to searchPtr')
+do
+  local tx = io.open('./openmw/apps/openmw/mwscript/transformationextensions.cpp'):read('*a')
+  local g = tx:find('class OpGetDistance', 1, true)
+  local a = g and tx:find('to = MWMechanics::nearestAvatarTo(from);', g, true)
+  local b = a and tx:find('if (to.isEmpty())\n                    to = MWBase::Environment::get().getWorld()->searchPtr(name, false);', a, true)
+  check('OpGetDistance tries the nearest avatar for "player", then the unchanged lookup', a ~= nil and b ~= nil
+    and tx:find('if (name == "player")', g, true) ~= nil)
+end
+
+print('1.7.1 quests.lua -- a failed restore, script start or script listing is printed, not swallowed')
+do
+  local e, q = questEnv()
+  setmetatable(e.globals, { __newindex = function(_, k) error('no global ' .. k) end })
+  e.mp.startGlobalScript = function() error('no such script') end
+  local listed = 0
+  e.mp.runningGlobalScripts = function() listed = listed + 1; error('engine refused') end
+  q.handlers.MP_GlobalVarSync({ globals = { mp_missing = 1 } })
+  q.handlers.MP_GlobalScriptsSync({ running = { 'MoveMehra' } })
+  q.tick(0); q.tick(5); q.tick(10)
+  local function said(s) local n = 0; for _, p in ipairs(e.calls.prints) do if p:find(s, 1, true) then n = n + 1 end end; return n end
+  check('a global the sync cannot restore is printed', said('global "mp_missing" not restorable here') == 1)
+  check('a campaign script that cannot start is printed', said('could not start "MoveMehra"') == 1)
+  check('a failed script listing is printed once, not every poll', listed >= 2 and said('cannot list running scripts') == 1)
+end
+
+
+print('1.7.1 avatar.lua keeps its policy (placed, pvp, the avatar set) across a script reload')
+do
+  local names = { 'openmw.core', 'openmw.self', 'openmw.types', 'openmw.interfaces', 'openmw.mp', 'openmw.util' }
+  local saved = {}
+  for _, m in ipairs(names) do saved[m] = package.loaded[m] end
+  package.loaded['openmw.core'] = { getRealTime = function() return 0 end, sendGlobalEvent = function() end }
+  package.loaded['openmw.self'] = { controls = {}, object = { id = 'av' }, enableAI = function() end }
+  package.loaded['openmw.types'] = { Actor = { STANCE = { Nothing = 0, Weapon = 1 }, getStance = function() return 0 end,
+    setStance = function() end, inventory = function() return { getAll = function() return {} end } end } }
+  package.loaded['openmw.interfaces'] = {}
+  package.loaded['openmw.mp'] = {}
+  package.loaded['openmw.util'] = { vector3 = function(x, y, z) return { x = x, y = y, z = z } end }
+  local okA, av = pcall(dofile, './openmw/files/data/scripts/mp/avatar.lua')
+  check('avatar.lua loads under the stubs', okA and av and av.engineHandlers, tostring(av))
+  if okA and av then
+    local eh = av.engineHandlers
+    check('avatar.lua has onSave and onLoad', type(eh.onSave) == 'function' and type(eh.onLoad) == 'function')
+    av.eventHandlers.mpAvatarPolicy({ pvp = true, placed = true, avatarObjIds = { a1 = true, a2 = true } })
+    local data = eh.onSave()
+    local okB, again = pcall(dofile, './openmw/files/data/scripts/mp/avatar.lua')
+    if okB and again then
+      check('a fresh copy starts with no policy', again.engineHandlers.onSave().placed == false)
+      again.engineHandlers.onLoad(data)
+      local back = again.engineHandlers.onSave()
+      check('onLoad restores placed, pvpEnabled and avatarObjIds',
+        back.placed == true and back.pvpEnabled == true and back.avatarObjIds.a1 == true and back.avatarObjIds.a2 == true)
+      again.engineHandlers.onLoad(nil)
+      check('an empty save (an older body) is a no-op', again.engineHandlers.onSave().placed == true)
+    end
+  end
+  for _, m in ipairs(names) do package.loaded[m] = saved[m] end
+end
+
+print('1.7.1 silent failures are said: a refused drop that cannot go back, an avatar detach that throws')
+do
+  local g = io.open('./openmw/files/data/scripts/mp/global.lua'):read('*a')
+  local ob = io.open('./openmw/files/data/scripts/mp/objects.lua'):read('*a')
+  check('the put-back moveInto of a refused drop logs its failure',
+    ob:find("local okM, errM = pcall(function() obj:moveInto(types.Actor.inventory(player)) end)", 1, true) ~= nil
+    and ob:find("[mp] refused drop of %s could not go back into the pack: %s", 1, true) ~= nil)
+  check('mpAvatarDetached guards removeScript and says why it failed',
+    g:find("local ok, err = pcall(function() data.obj:removeScript('scripts/mp/avatar.lua') end)", 1, true) ~= nil
+    and g:find("data.obj:removeScript('scripts/mp/avatar.lua')\n", 1, true) == nil)
+end
 print(string.format('\n%d passed, %d failed', pass, fail))
 os.exit(fail == 0 and 0 or 1)

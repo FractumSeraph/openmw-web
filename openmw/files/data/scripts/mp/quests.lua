@@ -61,6 +61,7 @@ local journal = {} -- questId -> index (diff cache AND echo guard)
 -- replaying a 3-stage log arrives as three echoes that `journal` (a single slot, already at
 -- the last stage) would read as local regressions and send back (backlog 335).
 local applied = {}
+local APPLIED_ECHO_S = 5 -- how long an applied stage's onQuestUpdate counts as its echo
 local journalSent = 0 -- JournalEntry broadcasts WE originated (echo-guard evidence)
 local journalSynced = false -- MP_JournalSync consumed?
 local pendingJournal = {} -- questId -> index observed locally before the sync landed
@@ -94,6 +95,12 @@ local lockPending = nil -- GameObject we asked for and have not heard back about
 local lockHeld = nil -- GameObject we currently hold the conversation on
 local lockAllowOnce = nil -- obj.id whose next activation must pass through unblocked
 local lockForced = false -- the window is already open (ForceGreeting): no activateBy on grant
+-- Real time of a grant whose window has not opened yet (1.7.1). The grant re-runs the
+-- activation; if no Dialogue (or pickpocket Container) opens -- the NPC turned hostile, the
+-- engine refused, the activation was eaten -- nothing ever released the lock and the NPC
+-- read "talking to <you>" for everyone until you left the cell.
+local lockGrantedAt = nil
+local LOCK_OPEN_TIMEOUT = 1.0
 local lastLockMirror = nil
 
 local nextDiffAt = 0
@@ -118,22 +125,35 @@ local function notice(text)
     if deps.noticeFn then deps.noticeFn(text) end
 end
 
+-- The server's cell key for a cell: "x,y" for an exterior, the lowercased name otherwise.
+local function cellKeyOf(cell)
+    if not cell then return deps.ownCellKeyFn and deps.ownCellKeyFn() or nil end
+    return cell.isExterior and (cell.gridX .. ',' .. cell.gridY) or string.lower(cell.name)
+end
+
 -- ================================================================== journal
 
 -- `stamp` (optional, from JournalSync's journalLog): {d=dayspassed, m=month, dm=day of
 -- month} the entry was earned on. With mp.addJournalEntryAt the engine keeps that date;
 -- without it (older engine) the entry lands dated today, as before (backlog 257).
-local function applyJournalEntry(questId, index, stamp)
+-- `regress` (1.7.1): the server says this is an AUTHORISED move down (an owner's or the
+-- peer's restart, JournalSync's authoritative map). Anything else only ever raises the stage:
+-- a relayed entry from a lagging engine, or a log line replayed under a later stage, used to
+-- set quest.stage unconditionally and walk the quest backwards.
+local function applyJournalEntry(questId, index, stamp, regress)
     -- Cache FIRST: the engine's onQuestUpdate for this apply arrives a frame later and is
     -- recognised as our own echo by value. Caching before the player-object check matters:
     -- JournalSync can land before world.players[1] exists, and an unseeded cache would make
     -- the first local quest signal look like a fresh local change.
-    journal[questId] = index
+    local cached = journal[questId]
+    journal[questId] = (regress or cached == nil) and index or math.max(cached, index)
+    -- Kept through a network regression: JournalSync's map lands after its log, and the log's
+    -- later stages still echo a frame later. Entries expire (APPLIED_ECHO_S) instead.
     applied[questId] = applied[questId] or {}
-    applied[questId][index] = true
+    applied[questId][index] = core.getRealTime()
     local player = playerObj()
     if not player then
-        pendingApply[#pendingApply + 1] = { q = questId, i = index, stamp = stamp } -- retried from tick()
+        pendingApply[#pendingApply + 1] = { q = questId, i = index, stamp = stamp, regress = regress } -- retried from tick()
         return false
     end
     local all = types.Player.quests(player)
@@ -144,6 +164,10 @@ local function applyJournalEntry(questId, index, stamp)
         print('[mp] journal: no quest record "' .. tostring(questId) .. '" in this content')
         return false
     end
+    local okHave, have = pcall(function() return quest.stage end)
+    local target = index
+    if not regress and okHave and type(have) == 'number' and have > index then target = have end
+    journal[questId] = target
     applying = true
     -- addJournalEntry writes the REAL entry text from the content records; quest.stage alone
     -- only moves the index (mwdialogue/quest.cpp:52 — "The index must be set even if no
@@ -169,11 +193,12 @@ local function applyJournalEntry(questId, index, stamp)
     -- which means the client would silently stop reporting ANY local quest progress from that
     -- moment on. No error, no recovery, and the player's quests simply stop travelling.
     -- belt and braces: never assume addEntry left the index where we want it.
-    local okStage, stageErr = pcall(function() quest.stage = index end)
+    -- max(local, index) unless authorised: addEntry may have moved the index to `index`.
+    local okStage, stageErr = pcall(function() quest.stage = target end)
     applying = false
     if not okStage then
         print('[mp] journal: could not set stage for "' .. tostring(questId) .. '" @'
-            .. tostring(index) .. ': ' .. tostring(stageErr))
+            .. tostring(target) .. ': ' .. tostring(stageErr))
         return false
     end
     return true
@@ -184,7 +209,13 @@ function quests.onQuestUpdate(questId, stage)
     stage = asInt(stage)
     if applying or type(questId) ~= 'string' or stage == nil then return end
     if journal[questId] == stage then return end -- echo of an applied entry
-    if applied[questId] and applied[questId][stage] then return end -- echo of a replayed log stage
+    -- Echo of a replayed log stage -- but only for a moment (1.7.1). The engine reports an
+    -- apply a frame later; held for the whole session, the set swallowed a REAL restart to
+    -- any stage the log had ever replayed, and the quest's later steps with it.
+    local at = applied[questId] and applied[questId][stage]
+    if at and core.getRealTime() - at <= APPLIED_ECHO_S then return end
+    -- The local player moved this quest DOWN (a restart): its old echo set is stale.
+    if journal[questId] ~= nil and stage < journal[questId] then applied[questId] = nil end
     journal[questId] = stage
     if not journalSynced then
         -- Broadcasting before the join-time sync would race the server's stored state.
@@ -331,18 +362,32 @@ local appliedTopics = {}
 -- normal play, so it costs one table lookup per diff and changes nothing for a player.
 local testLearned = {}
 
+local topicReadFailed = false -- topicSet's failure is printed once, not every diff
 local function topicSet()
     local player = playerObj()
     if not player then return nil end
-    local ok, set = pcall(function()
-        local out = {}
-        -- types.Player.journal(player).topics -- the topic store hangs off the JOURNAL
-        -- binding, not off the player directly.
-        for id in pairs(types.Player.journal(player).topics) do out[id] = true end
-        for id in pairs(testLearned) do out[id] = true end
-        return out
+    local out = {}
+    -- 1.7.1: the engine's KNOWN topics (DialogueManager::mKnownTopics, mp.knownTopics) -- an
+    -- AddTopic unlock lands there and nowhere else, so diffing only the journal's asked-about
+    -- topics never sent one. The journal set stays for an engine baked before the binding.
+    local okKnown, errKnown = pcall(function()
+        if not mp.knownTopics then error('no mp.knownTopics') end
+        for _, id in ipairs(mp.knownTopics()) do out[string.lower(id)] = true end
     end)
-    return ok and set or nil
+    -- types.Player.journal(player).topics -- the topic store hangs off the JOURNAL
+    -- binding, not off the player directly.
+    local okJournal, errJournal = pcall(function()
+        for id in pairs(types.Player.journal(player).topics) do out[string.lower(id)] = true end
+    end)
+    if not (okKnown or okJournal) then
+        if not topicReadFailed then
+            topicReadFailed = true
+            print('[mp] topics: cannot read known topics: ' .. tostring(errKnown) .. ' / ' .. tostring(errJournal))
+        end
+        return nil
+    end
+    for id in pairs(testLearned) do out[id] = true end
+    return out
 end
 
 -- BASELINE FIRST, THEN LEARN. A client that has not diffed yet has knownTopics == nil, and the
@@ -358,7 +403,7 @@ end
 function quests.testLearnTopic(id)
     if type(id) ~= 'string' or id == '' then return end
     if knownTopics == nil then knownTopics = topicSet() or {} end
-    testLearned[id] = true
+    testLearned[string.lower(id)] = true
 end
 
 local function diffTopics()
@@ -388,14 +433,22 @@ function quests.applyTopics(list)
     if not player or type(list) ~= 'table' then return end
     if knownTopics == nil then knownTopics = topicSet() or {} end
     for _, id in ipairs(list) do
-        if type(id) == 'string' and id ~= '' and not knownTopics[id] then
-            knownTopics[id] = true
-            pcall(function() types.Player.addTopic(player, id) end)
-            -- OBSERVABLE RECEIPT. addTopic itself leaves no trace a script can read, so without
-            -- this the receiving half of topic sync cannot be asserted on at all -- which is
-            -- half of why this feature went unproven for so long. Recorded, not mirrored here;
-            -- the mirror below publishes it on the ordinary beat.
-            appliedTopics[#appliedTopics + 1] = id
+        local key = type(id) == 'string' and id ~= '' and string.lower(id) or nil
+        if key and not knownTopics[key] then
+            knownTopics[key] = true
+            -- DialogueManager::addTopic (mwlua/types/player.cpp): the topic joins mKnownTopics,
+            -- so NPCs offer it. A failure (a topic this content lacks) is said, and left out
+            -- of the baseline so the next sync retries it.
+            local ok, err = pcall(function() types.Player.addTopic(player, id) end)
+            if ok then
+                -- OBSERVABLE RECEIPT. addTopic itself leaves no trace a script can read, so
+                -- without this the receiving half of topic sync cannot be asserted on at all.
+                -- Recorded, not mirrored here; the mirror below publishes it on the ordinary beat.
+                appliedTopics[#appliedTopics + 1] = id
+            else
+                knownTopics[key] = nil
+                print('[mp] topics: addTopic "' .. id .. '" failed: ' .. tostring(err))
+            end
         end
     end
 end
@@ -419,6 +472,9 @@ function quests.onActivate(object, actor)
     if not object.contentFile then return end -- runtime objects have no portable RefNum
     local script = world.mwscript.getLocalScript(object)
     if not script then return end
+    -- 1.7.1: the server's trace for a quest write this activation's OnActivate may make outside
+    -- a conversation (quests.ts guestWriteUnbacked). Sent before the script runs, so it lands first.
+    mp.sendEvent('ObjectActivated', { ref = object, cellKey = cellKeyOf(object.cell) })
     -- The NPC we are talking to is already watched for the whole conversation (armWatch on
     -- the grant); the re-run activation must not shorten that to the 6 s window.
     if lockHeld and lockHeld.id == object.id and memberWatch[object.id] then return end
@@ -436,9 +492,11 @@ local function flushMemberVars(watch)
     for name, value in pairs(snap) do
         if watch.last[name] ~= value then
             watch.last[name] = value
-            -- No cellKey in the body: the server infers it from our current cell.
+            -- The OBJECT's cell (1.7.1), which the server validates against our reach: inferred
+            -- from ours, an NPC's locals were filed under whatever cell the player stood in.
+            local okk, key = pcall(function() return cellKeyOf(watch.obj.cell) end)
             local a = npcAddr(watch.obj)
-            if a then mp.sendEvent('MemberVarUpdate', { ref = a.ref, net = a.net, name = name, value = value, cellKey = watch.cellKey }) end
+            if a then mp.sendEvent('MemberVarUpdate', { ref = a.ref, net = a.net, name = name, value = value, cellKey = (okk and key) or watch.cellKey }) end
         end
     end
 end
@@ -451,31 +509,34 @@ end
 -- rarely the object's.
 local HELD_WATCH_POLL = 1.0
 local heldScanAt = 0
-local function armHeldWatches(now)
-    if now < heldScanAt or not (mp.isSystem and mp.isSystem()) or not deps.heldCellsFn then return end
-    heldScanAt = now + SCRIPTED_SCAN_INTERVAL
-    for _, cell in ipairs(deps.heldCellsFn()) do
-        local cellKey = cell.isExterior and (cell.gridX .. ',' .. cell.gridY) or string.lower(cell.name)
-        local okc, list = pcall(function() return cell:getAll() end)
-        for _, obj in ipairs(okc and list or {}) do
-            if not memberWatch[obj.id] and npcAddr(obj) then
-                local oks, script = pcall(world.mwscript.getLocalScript, obj)
-                -- `variables` is userdata with __pairs, not a table: next() throws (116 peer
-                -- onUpdate failures in #102, s114); pairs() is the only way to ask.
-                local hasVars = false
-                if oks and script then
-                    local okp = pcall(function() for _ in pairs(script.variables) do hasVars = true; break end end)
-                    hasVars = okp and hasVars
-                end
-                if hasVars then
-                    memberWatch[obj.id] = {
-                        obj = obj, script = script, last = scriptVarSnapshot(script), cellKey = cellKey,
-                        nextPoll = now + HELD_WATCH_POLL, poll = HELD_WATCH_POLL, until_ = math.huge,
-                    }
-                end
+-- Arm an open-ended watch on every scripted, addressable object in `cell` not already watched.
+local function armCellWatches(cell, now, poll, dialogue)
+    local cellKey = cellKeyOf(cell)
+    local okc, list = pcall(function() return cell:getAll() end)
+    for _, obj in ipairs(okc and list or {}) do
+        if not memberWatch[obj.id] and npcAddr(obj) then
+            local oks, script = pcall(world.mwscript.getLocalScript, obj)
+            -- `variables` is userdata with __pairs, not a table: next() throws (116 peer
+            -- onUpdate failures in #102, s114); pairs() is the only way to ask.
+            local hasVars = false
+            if oks and script then
+                local okp = pcall(function() for _ in pairs(script.variables) do hasVars = true; break end end)
+                hasVars = okp and hasVars
+            end
+            if hasVars then
+                memberWatch[obj.id] = {
+                    obj = obj, script = script, last = scriptVarSnapshot(script), cellKey = cellKey,
+                    nextPoll = now + poll, poll = poll, until_ = math.huge, dialogue = dialogue,
+                }
             end
         end
     end
+end
+
+local function armHeldWatches(now)
+    if now < heldScanAt or not (mp.isSystem and mp.isSystem()) or not deps.heldCellsFn then return end
+    heldScanAt = now + SCRIPTED_SCAN_INTERVAL
+    for _, cell in ipairs(deps.heldCellsFn()) do armCellWatches(cell, now, HELD_WATCH_POLL) end
 end
 
 local function tickMemberVars(now)
@@ -501,6 +562,14 @@ local function armLockWatch(obj)
         obj = obj, script = script, last = scriptVarSnapshot(script),
         nextPoll = core.getRealTime() + MEMBER_POLL, until_ = math.huge,
     }
+    -- A dialogue result may write ANOTHER object's locals ("lever"->Set state to 1): every
+    -- scripted object in the conversation's cell is watched until the release (1.7.1).
+    -- ponytail: an object in a cell this client has not loaded is written on no engine here
+    -- and cannot be watched; a result script writing such a far ref still does not travel.
+    if not (mp.isSystem and mp.isSystem()) then
+        local okc, cell = pcall(function() return obj.cell end)
+        if okc and cell then armCellWatches(cell, core.getRealTime(), HELD_WATCH_POLL, true) end
+    end
 end
 
 -- ================================================================== dialogue lock
@@ -546,6 +615,7 @@ function quests.isTalkingTo(obj)
 end
 
 function quests.releaseLock(why)
+    lockGrantedAt = nil
     local obj = lockHeld
     if obj then releasedId, releasedAt = obj.id, core.getRealTime() end
     lockHeld = nil
@@ -572,8 +642,21 @@ function quests.releaseLock(why)
     -- Their script locals too: the last diff, then the watch runs out like any other.
     local watch = memberWatch[obj.id]
     if watch then
-        if obj:isValid() then pcall(flushMemberVars, watch) end
+        if obj:isValid() then
+            local okf, errf = pcall(flushMemberVars, watch)
+            if not okf then print('[mp] memberVar: final flush on release failed: ' .. tostring(errf)) end
+        end
         watch.until_ = core.getRealTime() + MEMBER_WATCH_SECONDS
+    end
+    for _, w in pairs(memberWatch) do
+        if w.dialogue then
+            if w.obj:isValid() then
+                local okf, errf = pcall(flushMemberVars, w)
+                if not okf then print('[mp] memberVar: final flush on release failed: ' .. tostring(errf)) end
+            end
+            w.dialogue = nil
+            w.until_ = core.getRealTime() + MEMBER_WATCH_SECONDS
+        end
     end
     local a = npcAddr(obj)
     if a then mp.sendEvent('DialogueLock', { ref = a.ref, net = a.net, cellKey = deps.ownCellKeyFn(), want = false }) end
@@ -634,7 +717,7 @@ local handlers = {}
 handlers.MP_JournalEntry = function(data)
     local index = asInt(data.index)
     if type(data.questId) ~= 'string' or index == nil then return end
-    applyJournalEntry(data.questId, index)
+    applyJournalEntry(data.questId, index, nil, data.regress == true)
 end
 
 handlers.MP_JournalSync = function(data)
@@ -679,7 +762,9 @@ handlers.MP_JournalSync = function(data)
     end
     for questId, index in pairs(data.quests or {}) do
         local idx = asInt(index)
-        if type(questId) == 'string' and idx then applyJournalEntry(questId, idx) end
+        -- The map is the campaign's CURRENT stage, restarts included: authoritative over the
+        -- log above, which may hold later stages of a quest that was since restarted.
+        if type(questId) == 'string' and idx then applyJournalEntry(questId, idx, nil, true) end
     end
     -- The campaign's learned topics (backlog 51), through the same path a live TopicsLearned
     -- takes -- so they land in the baseline and are never re-announced as a discovery.
@@ -736,13 +821,19 @@ end
 -- each other), so this is the only way progress survives a relog or a world hop.
 handlers.MP_GlobalVarSync = function(data)
     local n = 0
+    -- World-shared globals arrive with the server's stored seq (1.7.1): ours restarts at 1
+    -- every session, and a write stamped below the stored one is refused as stale.
+    for name, seq in pairs(data.seqs or {}) do
+        if type(name) == 'string' and type(seq) == 'number' then globalSeq[name] = math.max(globalSeq[name] or 0, seq) end
+    end
     for name, value in pairs(data.globals or {}) do
         if type(name) == 'string' and type(value) == 'number' and not TIME_GLOBALS[string.lower(name)] then
             globals[name] = value
             applying = true
-            local ok = pcall(function() globalStore()[name] = value end)
+            local ok, err = pcall(function() globalStore()[name] = value end)
             applying = false
-            if ok then n = n + 1 end
+            if ok then n = n + 1
+            else print('[mp] global "' .. name .. '" not restorable here: ' .. tostring(err)) end
         end
     end
     if n > 0 then print('[mp] restored ' .. tostring(n) .. ' character globals') end
@@ -770,6 +861,7 @@ end
 local SCRIPTS_INTERVAL = 5.0
 local nextScriptsAt = 0
 local reportedScripts = nil -- name -> true, as last told to the server
+local scriptsReadFailed = false
 -- Never persisted: the tutorial's scripts stop themselves and would drag a joiner into chargen;
 -- Startup is the engine's own once-per-game entry (main is left alone -- it always runs).
 local function scriptIsCampaign(id)
@@ -780,7 +872,13 @@ end
 local function diffGlobalScripts()
     if not mp.runningGlobalScripts then return end
     local ok, list = pcall(mp.runningGlobalScripts)
-    if not (ok and type(list) == 'table') then return end
+    if not (ok and type(list) == 'table') then
+        if not scriptsReadFailed then
+            scriptsReadFailed = true -- once: this runs every 5 s
+            print('[mp] global scripts: cannot list running scripts: ' .. tostring(list))
+        end
+        return
+    end
     local now = {}
     for _, id in ipairs(list) do
         if type(id) == 'string' and scriptIsCampaign(id) then now[string.lower(id)] = true end
@@ -802,8 +900,9 @@ handlers.MP_GlobalScriptsSync = function(data)
     local n = 0
     for _, id in ipairs(data.running) do
         if type(id) == 'string' and scriptIsCampaign(id) then
-            local ok = pcall(mp.startGlobalScript, id)
-            if ok then n = n + 1 end
+            local ok, err = pcall(mp.startGlobalScript, id)
+            if ok then n = n + 1
+            else print('[mp] global scripts: could not start "' .. id .. '": ' .. tostring(err)) end
         end
     end
     if n > 0 then print('[mp] started ' .. tostring(n) .. ' campaign global scripts') end
@@ -959,7 +1058,10 @@ handlers.MP_DialogueLockResult = function(data)
         mirrorLock({ ref = obj.recordId, granted = true })
         -- Re-run the activation we cancelled; this time the handler lets it through. A forced
         -- greeting's window is already open: nothing to re-run.
-        if player and not forced then obj:activateBy(player) end
+        if player and not forced then
+            lockGrantedAt = core.getRealTime()
+            obj:activateBy(player)
+        end
     else
         -- A forced greeting on an NPC someone else holds: the window is open on our screen
         -- with no right to its results. Shut it; the notice says why.
@@ -979,6 +1081,11 @@ end
 quests.handlers = handlers
 
 -- ================================================================== lifecycle
+
+-- player.lua: a Dialogue/Container window opened on `obj`. The lock we hold on it is in use.
+function quests.onLockWindowOpened(obj)
+    if lockHeld and obj and lockHeld.id == obj.id then lockGrantedAt = nil end
+end
 
 function quests.onCellChanged()
     -- Walking away ends the conversation (the server releases on cell change too).
@@ -1073,7 +1180,7 @@ function quests.tick(now)
     if next(pendingApply) and playerObj() then
         local retry = pendingApply
         pendingApply = {}
-        for _, e in ipairs(retry) do applyJournalEntry(e.q, e.i, e.stamp) end
+        for _, e in ipairs(retry) do applyJournalEntry(e.q, e.i, e.stamp, e.regress) end
     end
     if now >= nextDiffAt then
         nextDiffAt = now + DIFF_INTERVAL
@@ -1085,6 +1192,10 @@ function quests.tick(now)
     if now >= nextScriptsAt then
         nextScriptsAt = now + SCRIPTS_INTERVAL
         diffGlobalScripts()
+    end
+    if lockGrantedAt and now - lockGrantedAt > LOCK_OPEN_TIMEOUT then
+        print('[mp] dialogue lock: no window opened within ' .. LOCK_OPEN_TIMEOUT .. ' s of the grant, releasing')
+        quests.releaseLock('noopen')
     end
     tickMemberVars(now)
     if now - lastMirror >= MIRROR_INTERVAL then
@@ -1114,6 +1225,7 @@ function quests.reset()
     lockHeld = nil
     lockAllowOnce = nil
     lockForced = false
+    lockGrantedAt = nil
 end
 
 -- ================================================================== test hooks
