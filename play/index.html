@@ -1192,13 +1192,21 @@ try {
      'The engine needs a secure page, and browsers only treat https:// (or this computer\'s own '
      + 'localhost) as one. Ask the server\'s owner for its https:// address, or play on the '
      + 'server machine itself at http://localhost.', false);
- } else if (!(navigator.userAgentData && navigator.userAgentData.brands
-     && navigator.userAgentData.brands.some(function(b){ return b.brand === 'Chromium'; }))){
-   // CHROMIUM ONLY, by brand: Firefox 134+ passes both probes below and still cannot carry the
-   // game. The front door (server/web/play.js) and the launcher say this before sign-in; this
-   // is for whoever arrives by a pasted link.
-   fatalOverlay('Open this in Chrome or Edge',
-     'This game runs in Chrome or Edge on a desktop or laptop. Open this page there.',
+ } else if (!((navigator.userAgentData && navigator.userAgentData.brands
+     && navigator.userAgentData.brands.some(function(b){ return b.brand === 'Chromium'; }))
+     || /\bFirefox\/\d+/.test(navigator.userAgent))){
+   // CHROMIUM OR FIREFOX, by brand. Firefox used to be refused here too ("passes both probes
+   // below and still cannot carry the game"). What it could not do was hold the mouse: the
+   // persist() call further down made Firefox open its "store data in persistent storage"
+   // popup, and Firefox refuses EVERY pointer lock while any browser popup is open (Gecko
+   // dom/base/PointerLockManager.cpp, IsPopupOpened -> PointerLockDeniedFailedToLock). Chrome
+   // decides persist() silently, so only Firefox lost mouse-look. With that call fixed (see
+   // "persistent storage" below) Firefox 134+ boots, renders and plays the same game; the
+   // probes below still turn away a Firefox too old for memory64. Safari has neither brand.
+   // The front door (server/web/play.js) and the launcher say this before sign-in; this is for
+   // whoever arrives by a pasted link.
+   fatalOverlay('Open this in Chrome, Edge or Firefox',
+     'This game runs in Chrome, Edge or Firefox on a desktop or laptop. Open this page there.',
      false, { actionLabel: 'Back', actionHref: '/' });
  } else if (!self.crossOriginIsolated || typeof SharedArrayBuffer === 'undefined'){
    // Chromium on a secure page without isolation is the server's headers, not the player.
@@ -1224,8 +1232,8 @@ try {
        return true;
      } catch (e) { return false; } })()){
    fatalOverlay('Update your browser',
-     'This game needs a newer Chrome or Edge (version 133 or later). Update it, then open '
-     + 'this page again.', false, { actionLabel: 'Back', actionHref: '/' });
+     'This game needs a newer browser: Chrome or Edge 133 or later, or Firefox 134 or later. '
+     + 'Update it, then open this page again.', false, { actionLabel: 'Back', actionHref: '/' });
  }
  // WebGL context loss: OSG/OpenMW has no GPU-resource restore path, so the correct handling
  // tier is: sync saves, tell the user, reload cleanly (state comes back from IndexedDB).
@@ -2452,11 +2460,33 @@ try {
        FS.mkdirTree('/userdata');
        // Ask the browser for durable storage: without persist(), IndexedDB (saves, settings)
        // and the Cache API archive are LRU-evictable under storage pressure.
+       //
+       // ONLY WHERE THE ANSWER IS SILENT. Chromium decides persist() by itself, with no UI.
+       // Firefox asks the player with a doorhanger popup, and while ANY browser popup is open
+       // Firefox refuses every pointer lock (PointerLockManager.cpp, IsPopupOpened ->
+       // "The browser failed to lock the pointer"): asked here, at boot, the popup sat next to
+       // the address bar while the player tried to look around, and mouse-look never engaged.
+       // So outside Chromium this only runs when the answer is already known; the question
+       // itself is asked on the launcher / sign-in page, from a button, where nothing needs the
+       // mouse captured (__omwAskPersist there). Declined or never asked, storage stays
+       // best-effort, exactly as on a Chromium that says no.
        try {
-         if (navigator.storage && navigator.storage.persist)
+         var askPersist = function(){
            navigator.storage.persist().then(function(granted){
              append('[storage] persistent storage ' + (granted ? 'GRANTED' : 'not granted (evictable)'));
            });
+         };
+         var silentPersist = !!(navigator.userAgentData && navigator.userAgentData.brands
+           && navigator.userAgentData.brands.some(function(b){ return b.brand === 'Chromium'; }));
+         if (navigator.storage && navigator.storage.persist) {
+           if (silentPersist) askPersist();
+           else if (navigator.storage.persisted)
+             navigator.storage.persisted().then(function(on){
+               append('[storage] persistent storage ' + (on ? 'GRANTED'
+                 : 'not requested here (this browser asks with a popup that would block the mouse); '
+                   + 'evictable unless allowed from the launcher'));
+             });
+         }
          if (navigator.storage && navigator.storage.estimate)
            navigator.storage.estimate().then(function(est){
              var q = Math.round((est.quota||0)/1048576), u = Math.round((est.usage||0)/1048576);
@@ -4449,7 +4479,8 @@ try {
    // Chrome words the same benign case several ways, and the case-sensitive 'Pointer lock' match
    // missed three of them ("Pointer is already locked.", "The user has exited the lock before this
    // request was completed.", "...not valid for pointer lock.") -- prod logged them as errors.
-   if (/pointer lock|pointer is already locked|exited the lock/i.test(String(e.reason && e.reason.message || e.reason))) { e.preventDefault(); return; }
+   // Firefox words its refusal "The browser failed to lock the pointer." (NotSupportedError).
+   if (/pointer lock|pointer is already locked|exited the lock|lock the pointer/i.test(String(e.reason && e.reason.message || e.reason))) { e.preventDefault(); return; }
    append('unhandled rejection: '+(e.reason && e.reason.message || e.reason),'err');
    showLogOnce();
    // The engine's file package failed to arrive: emscripten's loadPackage rejects with

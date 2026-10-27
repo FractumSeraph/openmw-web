@@ -274,12 +274,33 @@ test('a refused invite says where to get one', () => {
     'helpLink is defined before the refusal note uses it');
 });
 
-test('the front door: sign-in buttons are never greyed, a lost state cookie retries once, Chromium only', () => {
+test('the front door: sign-in buttons are never greyed, a lost state cookie retries once, Chromium or Firefox', () => {
   assert.doesNotMatch(play, /aria-disabled|classList\.toggle\('off'/, 'returning players are never locked out of the buttons');
   assert.match(play, /localStorage\.setItem\('omwmp:returning', '1'\)/, 'a sign-in that worked is remembered');
   assert.match(play, /if \(code === 'state'\) \{[\s\S]*?omwmp:stateRetry[\s\S]*?location\.href = again/, 'state is retried');
   assert.ok(play.indexOf("if (code === 'state')") < play.indexOf('const said = {'), 'retried before it is said');
   assert.match(play, /b\.brand === 'Chromium'/, 'the browser gate names the brand');
+  assert.ok(play.includes('const firefox = /\\bFirefox\\/\\d+/.test(navigator.userAgent)'), 'and lets Firefox through');
+});
+
+// FIREFOX COULD NOT HOLD THE MOUSE, and it was the game page's own doing. index.html asked
+// navigator.storage.persist() at boot; Firefox answers that with a doorhanger popup, and while
+// any browser popup is open Firefox refuses every pointer lock (Gecko PointerLockManager.cpp,
+// IsPopupOpened -> PointerLockDeniedFailedToLock). So mouse-look never engaged and Firefox was
+// gated out as unable to "carry the game". Pinned: the gates admit Firefox, the boot asks only
+// where the answer is silent (Chromium) or already given, the question moved to a button on the
+// launcher / front door, and Firefox's wording of a refused lock is treated as benign.
+const launcherPath = join(process.cwd(), '..', 'play', 'launcher.html');
+const launcher = existsSync(launcherPath) ? readFileSync(launcherPath, 'utf8') : '';
+
+test('Firefox plays: admitted by every gate, and the boot never opens the persist() popup', clientOpts, () => {
+  assert.ok(index.includes('|| /\\bFirefox\\/\\d+/.test(navigator.userAgent))){'), 'the game page admits Firefox');
+  assert.match(launcher, /return noSAB \|\| noMem64 \|\| phone \|\| !\(chromium \|\| firefox\);/, 'the launcher admits Firefox');
+  assert.equal(index.split('navigator.storage.persist()').length - 1, 1, 'persist() is called from one place in the game page');
+  assert.ok(index.includes('if (silentPersist) askPersist();'), 'and only where the browser answers without a popup');
+  assert.ok(launcher.includes('function firefoxStorageOffer()') && play.includes("id=\"keepData\""),
+    'Firefox is offered persistent storage from a button before the game instead');
+  assert.match(index, /exited the lock\|lock the pointer\/i/, "Firefox's refused-lock wording is benign");
 });
 
 test('a boot that cannot get its memory yet retries, then says so', clientOpts, () => {

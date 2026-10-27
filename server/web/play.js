@@ -78,15 +78,17 @@
     + '<path d="M24 22v10M20 28l4 4 4-4"/></svg>';
   if (singlePlayer) $('#glyph').innerHTML = CLOUD_GLYPH;
 
-  // CHROME OR EDGE ON A COMPUTER, SAID BEFORE SIGN-IN. The engine is a wasm64 build that only
-  // Chromium runs; a Firefox or Safari player used to sign in, wait for a download and only then
-  // meet "Browser not supported" on the game page. The brand is what decides it (Firefox 134+
-  // passes the memory64 probe and still cannot carry the game), the probe catches an old
-  // Chromium, and the phone test is the launcher's (engineUnsupported). Insecure pages are
-  // already explained above, and they hide the brand list, so they are not judged here.
+  // CHROME, EDGE OR FIREFOX ON A COMPUTER, SAID BEFORE SIGN-IN. The engine is a wasm64 build;
+  // a Safari player used to sign in, wait for a download and only then meet "Browser not
+  // supported" on the game page. The brand decides it, the probe catches a browser too old for
+  // memory64, and the phone test is the launcher's (engineUnsupported). Firefox was refused
+  // here as well until its real problem was found: the game page's persist() popup blocked
+  // pointer lock (see "persistent storage" in play/index.html). Insecure pages are already
+  // explained above, and they hide the brand list, so they are not judged here.
+  const firefox = /\bFirefox\/\d+/.test(navigator.userAgent);
   const unsupported = (() => {
     if (/[?&]forceUnsupported\b/.test(location.search)) return true;
-    const chromium = !!navigator.userAgentData?.brands?.some((b) => b.brand === 'Chromium');
+    const chromium = !!navigator.userAgentData?.brands?.some((b) => b.brand === 'Chromium') || firefox;
     let mem64 = true;
     try { new WebAssembly.Memory({ initial: 1n, maximum: 2n, address: 'i64' }); } catch { mem64 = false; }
     const touch = matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0;
@@ -94,8 +96,8 @@
     return !chromium || !mem64 || phone;
   })();
   if (self.isSecureContext && unsupported) {
-    $('#options').innerHTML = '<div class="note err">This game runs in <b>Chrome</b> or <b>Edge</b> '
-      + 'on a desktop or laptop. Open this page there.</div>'
+    $('#options').innerHTML = '<div class="note err">This game runs in <b>Chrome</b>, <b>Edge</b> '
+      + 'or <b>Firefox</b> on a desktop or laptop. Open this page there.</div>'
       + '<button class="btn" type="button" id="copyLink">Copy this link</button>';
     const copy = $('#copyLink');
     copy.onclick = async () => {
@@ -103,6 +105,29 @@
       catch { copy.textContent = location.href; }
     };
     return;
+  }
+
+  // Firefox asks persist() with a popup, which blocks pointer lock if it is open in game; the
+  // game page leaves the question to here (play/index.html, "persistent storage"). Same offer
+  // as the launcher's, under the sign-in options.
+  if (firefox && navigator.storage?.persist && navigator.storage?.persisted) {
+    // Already kept, or already refused ("Block" is remembered per site): nothing to offer.
+    const refused = navigator.permissions?.query
+      ? navigator.permissions.query({ name: 'persistent-storage' }).then((st) => st.state === 'denied', () => false)
+      : Promise.resolve(false);
+    Promise.all([navigator.storage.persisted(), refused]).then(([on, no]) => {
+      if (on || no) return;
+      const n = $('#note');
+      n.hidden = false;
+      n.innerHTML = 'Firefox support is new. To keep your saves and game files from being cleared '
+        + 'when the disk fills up, <button class="btn" type="button" id="keepData">keep them on '
+        + 'this computer</button>.';
+      $('#keepData').onclick = async () => {
+        const granted = await navigator.storage.persist();
+        n.textContent = granted ? 'Saved games and game files will be kept on this computer.'
+          : 'Firefox did not allow it, so they may be cleared if the disk fills up. You can still play.';
+      };
+    }).catch(() => {});
   }
 
   let auth = null;
