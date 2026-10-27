@@ -2198,8 +2198,17 @@ try {
          // tier when it is absent rather than assuming the best case.
          // ?tier=low|mid|high forces one (QA, and a support answer for "it runs badly").
          var __devMem = (typeof navigator !== 'undefined' && navigator.deviceMemory) || 0;
+         // NO deviceMemory (Firefox, Safari): the thread count stands in. Without it every Firefox
+         // was 'mid', and lru 96 sits under the ~259-chunk working set measured above: a cold boot
+         // into Seyda Neen on a 32-thread desktop missed 196 chunks against 139 at 'high', stalled
+         // the main thread 33 s against 30 s and fetched 396 MB against 279 MB -- while Chrome on the
+         // same machine got 'high' (it reports 8). Eight or more threads is a desktop or a recent
+         // laptop, which is where Chrome reports 8 GB and up; anything less stays 'mid', never 'low'
+         // (too little evidence to cut the view distance). A fingerprint-resisting Firefox reports 2.
+         var __cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 0;
          var __tier = (/[?&]tier=(low|mid|high)/.exec(location.search) || [])[1]
-                   || (__devMem >= 8 ? 'high' : (__devMem > 0 && __devMem <= 4 ? 'low' : 'mid'));
+                   || (__devMem >= 8 ? 'high' : (__devMem > 0 && __devMem <= 4 ? 'low'
+                   : (!__devMem && __cores >= 8 ? 'high' : 'mid')));
          // Only the knobs whose cost scales with the scene. Everything else stays common.
          // lru = streamfs chunk slots (2MB each), i.e. the JS-side cache ceiling on top of the
          // wasm heap. MEASURED in Balmora at matched workload: the old flat 128 was thrashing --
@@ -2218,7 +2227,7 @@ try {
          // streamfs.js is parsed before this runs, so it resolves LRU_MAX lazily from this global.
          try { window.__omwLruDefault = TIER.lru; } catch(e){}
          try { window.__omwTier = { tier: __tier, deviceMemory: __devMem || null }; } catch(e){}
-         append('[tier] '+__tier+' (navigator.deviceMemory='+(__devMem||'unknown')+', lru='+TIER.lru+')');
+         append('[tier] '+__tier+' (navigator.deviceMemory='+(__devMem||'unknown')+(__devMem ? '' : ', threads='+(__cores||'unknown'))+', lru='+TIER.lru+')');
          // IMPORTANT: OpenMW loads user settings from <last active config dir>/settings.cfg.
          // In this build the only config dir is '/' (where openmw.cfg lives), NOT the XDG
          // path — write the file to BOTH so the engine actually reads it.

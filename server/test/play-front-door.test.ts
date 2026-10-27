@@ -301,6 +301,9 @@ test('Firefox plays: admitted by every gate, and the boot never opens the persis
   assert.ok(launcher.includes('function firefoxStorageOffer()') && play.includes("id=\"keepData\""),
     'Firefox is offered persistent storage from a button before the game instead');
   assert.match(index, /exited the lock\|lock the pointer\/i/, "Firefox's refused-lock wording is benign");
+  // No navigator.deviceMemory in Firefox: without a stand-in every Firefox was 'mid', whose 96-slot
+  // chunk cache sits under the boot's working set (more misses, stalls and bytes than Chrome).
+  assert.ok(index.includes("(!__devMem && __cores >= 8 ? 'high' : 'mid')"), 'the thread count stands in for deviceMemory');
 });
 
 test('a boot that cannot get its memory yet retries, then says so', clientOpts, () => {
