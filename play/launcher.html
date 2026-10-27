@@ -423,9 +423,9 @@ html.door .topbar, html.door .wrap { display:none !important }
        that DO work on a phone instead of a dead end. The cards below stay reachable on purpose:
        detection can be wrong, and being wrong should cost prominence, not access. -->
   <div class="unsupported" id="unsupported" hidden>
-    <h2>This needs Chrome or Edge on a computer</h2>
+    <h2>This needs Chrome, Edge or Firefox on a computer</h2>
     <p class="lead">The game runs on your own machine, in <b>Chrome</b> or <b>Edge</b> 133+
-      (or Brave) on a desktop or laptop. Until you are there you can still:</p>
+      (or Brave), or <b>Firefox</b> 134+, on a desktop or laptop. Until you are there you can still:</p>
     <div class="u-actions">
       <a class="btn btn-solid" href="https://www.youtube.com/watch?v=iqZ20MtdD4I"
          target="_blank" rel="noopener">Watch it running <span class="arw">▸</span></a>
@@ -901,11 +901,45 @@ html.door .topbar, html.door .wrap { display:none !important }
    // short side just like a phone, but no phone is 1100 wide in either orientation.
    const touch = matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0;
    const phone = touch && Math.min(innerWidth, innerHeight) < 820 && Math.max(innerWidth, innerHeight) < 1100;
-   // Chromium by brand as well: Firefox 134+ passes every probe above and cannot carry the game.
+   // Chromium or Firefox by brand. Firefox passes every probe above; it used to be refused
+   // here because it could not hold the mouse in game, which turned out to be the game page's
+   // own persist() popup (see "persistent storage" in index.html). Safari has neither brand.
    const chromium = !!(navigator.userAgentData && navigator.userAgentData.brands
      && navigator.userAgentData.brands.some(function(b){ return b.brand === 'Chromium'; }));
-   return noSAB || noMem64 || phone || !chromium;
+   const firefox = /\bFirefox\/\d+/.test(navigator.userAgent);
+   return noSAB || noMem64 || phone || !(chromium || firefox);
  }
+
+ // FIREFOX: ASK FOR PERSISTENT STORAGE HERE, NOT IN THE GAME. Firefox answers persist() with a
+ // popup, and an open popup blocks pointer lock, so the game page no longer asks (index.html,
+ // "persistent storage"). This is the place to ask: a button, nothing needs the mouse, and the
+ // answer is per site, so the game page then sees it as already decided. Shown only where the
+ // question is still open; Chromium answers silently in the game and never sees this.
+ (function firefoxStorageOffer(){
+   if (!/\bFirefox\/\d+/.test(navigator.userAgent) || engineUnsupported()) return;
+   if (!(navigator.storage && navigator.storage.persist && navigator.storage.persisted)) return;
+   // Already kept, or already refused ("Block" is remembered per site): nothing to offer.
+   const refused = navigator.permissions && navigator.permissions.query
+     ? navigator.permissions.query({ name: 'persistent-storage' }).then(function(st){ return st.state === 'denied'; }, function(){ return false; })
+     : Promise.resolve(false);
+   Promise.all([navigator.storage.persisted(), refused]).then(function(r){
+     if (r[0] || r[1]) return;
+     const box = document.createElement('div');
+     box.className = 'note muted';
+     box.style.cssText = 'margin:0 auto 18px; max-width:760px; text-align:center';
+     box.innerHTML = 'Firefox support is new. To keep your saves and downloaded game files from '
+       + 'being cleared when the disk fills up, <button class="btn btn-ghost" type="button" '
+       + 'style="padding:4px 12px; margin-left:6px">Keep them on this computer</button>';
+     box.querySelector('button').addEventListener('click', function(){
+       navigator.storage.persist().then(function(granted){
+         box.textContent = granted ? 'Saved games and game files will be kept on this computer.'
+           : 'Firefox did not allow it, so they may be cleared if the disk fills up. You can still play.';
+       });
+     });
+     const cards = document.querySelector('.cards');
+     if (cards && cards.parentNode) cards.parentNode.insertBefore(box, cards);
+   });
+ })();
 
  (function gateOnCapability(){
    if (!engineUnsupported()) return;         // desktop Chromium: nothing changes
