@@ -2197,6 +2197,17 @@ try {
          // not implement it at all. So treat it only as a floor hint, and default to the MIDDLE
          // tier when it is absent rather than assuming the best case.
          // ?tier=low|mid|high forces one (QA, and a support answer for "it runs badly").
+         // Does this browser's WebGL2 have EXT_clip_control? Without it the engine renders with a
+         // standard depth buffer, where water refraction is broken (see 'refraction' below).
+         try {
+           if (window.__omwNoRefr === undefined) {
+             var __gl = document.createElement('canvas').getContext('webgl2');
+             window.__omwNoRefr = !!__gl && !__gl.getExtension('EXT_clip_control');
+             var __lose = __gl && __gl.getExtension('WEBGL_lose_context');
+             if (__lose) __lose.loseContext();
+             if (window.__omwNoRefr) append('[water] no EXT_clip_control: standard depth buffer, refraction off');
+           }
+         } catch (e) { window.__omwNoRefr = false; }
          var __devMem = (typeof navigator !== 'undefined' && navigator.deviceMemory) || 0;
          // NO deviceMemory (Firefox, Safari): the thread count stands in. Without it every Firefox
          // was 'mid', and lru 96 sits under the ~259-chunk working set measured above: a cold boot
@@ -2272,13 +2283,25 @@ try {
            'lod factor = ' + ((/[?&]lodfactor=([0-9.]+)/.exec(location.search)||[])[1] || '1.0') + '\n' +
            '[Water]\n' +
            'shader = true\n' +                     // real water shader (reflections/refractions)
+           // (refraction below: off where the engine would use a standard depth buffer, see __omwNoRefr)
            // reflection detail: 0=sky only (no scene geometry re-rendered into the reflection),
            // 2=statics+terrain, 3=World, 4=Objects, 5=Groundcover. Higher = more draw calls in the
            // reflection pass (CPU cost). DEFAULT 0 for now: reflecting the dark near-shore bank produced
            // an ugly dark band at the waterline, so we reflect only the sky (clean, vanilla-like) until
            // that's tuned. ?refldetail=N to opt geometry reflections back in (e.g. 3 = World).
            'reflection detail = ' + ((/[?&]refldetail=(\d+)/.exec(location.search)||[])[1] || (/[?&]norefl=1\b/.test(location.search) ? '0' : '0')) + '\n' +
-           'refraction = ' + (/[?&]norefr=1\b/.test(location.search) ? 'false' : 'true') + '\n' +   // ?norefr=1 disables refraction (QA isolation).
+           // REFRACTION NEEDS THE REVERSE-Z PATH. Without EXT_clip_control (Firefox, so far) the
+           // engine falls back to a standard depth buffer (SceneUtil::SelectDepthFormatOperation:
+           // "clip_control unavailable (WebGL2)"), and there the refracted water draws as if every
+           // sea were zero deep: water.frag's shore blend shows only the refraction texture, so the
+           // sea reads as bare seabed with a dotted line at the shore. Chrome does exactly the same
+           // with [Camera] reverse z = false, so it is the standard-depth refraction path, not the
+           // browser. Without refraction the water draws correctly on that path (reflection, waves,
+           // fog). Until the engine side is fixed, turn refraction off there. ?refr=1 forces it on
+           // (to check an engine fix); ?norefr=1 still turns it off everywhere (QA isolation).
+           'refraction = ' + (/[?&]norefr=1\b/.test(location.search) ? 'false'
+             : /[?&]refr=1\b/.test(location.search) ? 'true'
+             : (window.__omwNoRefr ? 'false' : 'true')) + '\n' +
            // rtt size 1024 (was 512): sharper reflection/refraction (max-fidelity default). GPU cost
            // only (we're CPU-bound), and water.frag's reflectionBlur is rtt-aware (~3 texels) so the
            // sharper buffer reads sharper instead of over-blurring. ?rtt=N overrides (QA).

@@ -304,6 +304,10 @@ test('Firefox plays: admitted by every gate, and the boot never opens the persis
   // No navigator.deviceMemory in Firefox: without a stand-in every Firefox was 'mid', whose 96-slot
   // chunk cache sits under the boot's working set (more misses, stalls and bytes than Chrome).
   assert.ok(index.includes("(!__devMem && __cores >= 8 ? 'high' : 'mid')"), 'the thread count stands in for deviceMemory');
+  // Without EXT_clip_control the engine uses a standard depth buffer, where refracted water draws
+  // as bare seabed; refraction stays off there until the engine path is fixed (?refr=1 forces it).
+  assert.ok(index.includes("window.__omwNoRefr = !!__gl && !__gl.getExtension('EXT_clip_control');"), 'clip_control is probed');
+  assert.ok(index.includes("(window.__omwNoRefr ? 'false' : 'true')"), 'and refraction follows it');
 });
 
 test('a boot that cannot get its memory yet retries, then says so', clientOpts, () => {
