@@ -240,10 +240,17 @@
         f = (async () => {
           if (!opfsRoot) opfsRoot = await (await navigator.storage.getDirectory()).getDirectoryHandle('sfs-chunks-v1', { create: true });
           const name = opfsName(pkey);
-          const h = await (await opfsRoot.getFileHandle(name + '.dat', { create: true })).createSyncAccessHandle();
-          let m;
-          try { m = await (await opfsRoot.getFileHandle(name + '.map', { create: true })).createSyncAccessHandle(); }
-          catch (err) { h.close(); throw err; }
+          // BOTH HANDLES AT ONCE. Each open is a getFileHandle plus a createSyncAccessHandle, and in
+          // Firefox those are round trips to another process: measured on a cold boot into Seyda
+          // Neen (110 files in the preload), 29 ms + 59 ms per handle in Firefox 158 against 5 ms +
+          // 15 ms in Chrome 156. One after the other, two per file, that was ~4 s of Firefox's boot.
+          const open = (ext) => opfsRoot.getFileHandle(name + ext, { create: true }).then((fh) => fh.createSyncAccessHandle());
+          const both = await Promise.allSettled([open('.dat'), open('.map')]);
+          if (both[0].status !== 'fulfilled' || both[1].status !== 'fulfilled') {
+            for (const r of both) if (r.status === 'fulfilled') { try { r.value.close(); } catch (e) { /* gone */ } }
+            throw (both[0].status === 'rejected' ? both[0].reason : both[1].reason);
+          }
+          const h = both[0].value, m = both[1].value;
           const flags = new Uint8Array(Math.max(64, m.getSize()));
           m.read(flags.subarray(0, m.getSize()), { at: 0 });
           if (!opfsSaid) { opfsSaid = true; postMessage({ store: 'file' }); }
@@ -415,7 +422,18 @@
           const copy = buf.slice(); // its own buffer, transferred; the store keeps the original
           postMessage({ preload: id, done, total, bytes, have, fi: j.fi, s: j.s, buf: copy }, [copy.buffer]);
         };
-        const lane = async () => { while (next < jobs.length) await one(jobs[next++]); };
+        // OPEN AHEAD. A lane's first touch of a file waits for its store handles before it can even
+        // ask the network, and a cold boot touches ~110 files, most of them one chunk each. So the
+        // handles for the files the next few jobs need are opened while the lanes fetch: the open
+        // then costs nothing on the lane. Kept well under OPFS_OPEN so nothing opened ahead is
+        // closed again before its lane arrives.
+        const AHEAD = 12;
+        let ahead = 0;
+        const openAhead = () => {
+          for (; ahead < jobs.length && ahead < next + AHEAD; ahead++) opfsFile(jobs[ahead].f.pkey);
+        };
+        const lane = async () => { while (next < jobs.length) { const j = jobs[next++]; openAhead(); await one(j); } };
+        openAhead();
         await Promise.all([lane(), lane(), lane(), lane()]);
         postMessage({ preload: id, end: true, done, total, bytes, have });
       }
